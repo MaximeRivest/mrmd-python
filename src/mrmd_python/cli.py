@@ -84,10 +84,11 @@ def main():
             host=args.host,
             port=args.port,
             reload=True,
+            access_log=False,  # Disable access log to prevent it leaking into execution output
         )
     else:
         app = create_app(cwd=cwd, assets_dir=assets_dir)
-        uvicorn.run(app, host=args.host, port=args.port)
+        uvicorn.run(app, host=args.host, port=args.port, access_log=False)
 
 
 # For reload mode

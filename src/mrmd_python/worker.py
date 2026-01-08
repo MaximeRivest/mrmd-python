@@ -39,6 +39,7 @@ from .types import (
     VariablesResult,
     VariableDetail,
     IsCompleteResult,
+    StdinRequest,
 )
 
 
@@ -638,15 +639,18 @@ class IPythonWorker:
         on_output: Callable[[str, str, str], None],
         store_history: bool = True,
         exec_id: str | None = None,
+        on_stdin_request: Callable[[StdinRequest], str] | None = None,
     ) -> ExecuteResult:
         """
-        Execute code with streaming output.
+        Execute code with streaming output and optional stdin support.
 
         Args:
             code: Code to execute
             on_output: Callback(stream, content, accumulated) for each output chunk
             store_history: Whether to store in IPython history
             exec_id: Execution ID for asset naming
+            on_stdin_request: Callback(StdinRequest) -> str for handling input() calls.
+                              If None, input() will raise an error.
 
         Returns:
             ExecuteResult with final result
@@ -751,6 +755,44 @@ class IPythonWorker:
 
         result = ExecuteResult()
 
+        # Hook builtins.input for stdin support
+        import builtins
+        original_input = builtins.input
+
+        def hooked_input(prompt=""):
+            """Custom input() that uses the stdin callback."""
+            if on_stdin_request is None:
+                raise RuntimeError(
+                    "input() is not supported in this execution context. "
+                    "The client must provide stdin support."
+                )
+
+            # Flush stdout so prompt appears before we request input
+            sys.stdout.write(prompt)
+            sys.stdout.flush()
+
+            # Create stdin request
+            request = StdinRequest(
+                prompt=prompt,
+                password=False,
+                execId=exec_id or ""
+            )
+
+            # Call the callback and wait for response
+            # The callback is expected to block until input is provided
+            response = on_stdin_request(request)
+
+            # Echo the input (like a terminal would)
+            sys.stdout.write(response)
+            if not response.endswith('\n'):
+                sys.stdout.write('\n')
+            sys.stdout.flush()
+
+            # Return without trailing newline (like real input())
+            return response.rstrip('\n')
+
+        builtins.input = hooked_input
+
         try:
             exec_result = self.shell.run_cell(code, store_history=store_history, silent=False)
             self._ensure_matplotlib_hook()
@@ -796,6 +838,9 @@ class IPythonWorker:
             result.success = False
 
         finally:
+            # Restore original input function
+            builtins.input = original_input
+
             sys.stdout.flush()
             sys.stderr.flush()
 

@@ -94,9 +94,8 @@ class SessionManager:
                 return True
             return False
 
-    def register_pending_input(self, exec_id: str) -> asyncio.Future:
+    def register_pending_input(self, exec_id: str, loop: asyncio.AbstractEventLoop) -> asyncio.Future:
         """Register that an execution is waiting for input."""
-        loop = asyncio.get_event_loop()
         future = loop.create_future()
         self._pending_inputs[exec_id] = future
         return future
@@ -259,11 +258,49 @@ class MRPServer:
                     loop,  # Use captured loop
                 )
 
+            def on_stdin_request(request):
+                """Called from worker thread when input() is called.
+
+                This function blocks until input is provided via POST /input.
+                """
+                from .types import StdinRequest
+
+                # Send stdin_request event to client
+                asyncio.run_coroutine_threadsafe(
+                    output_queue.put({
+                        "event": "stdin_request",
+                        "data": {
+                            "prompt": request.prompt,
+                            "password": request.password,
+                            "execId": request.execId,
+                        },
+                    }),
+                    loop,
+                )
+
+                # Register that we're waiting for input and get a future
+                future = self.session_manager.register_pending_input(exec_id, loop)
+
+                # Wait for the input (blocking - we're in a worker thread)
+                # Use run_coroutine_threadsafe to wait on the future from this thread
+                async def wait_for_input():
+                    return await future
+
+                concurrent_future = asyncio.run_coroutine_threadsafe(wait_for_input(), loop)
+
+                try:
+                    # Wait up to 5 minutes for input
+                    response = concurrent_future.result(timeout=300)
+                    return response
+                except Exception as e:
+                    raise RuntimeError(f"Failed to get input: {e}")
+
             def run_execution():
                 """Run execution in thread."""
                 try:
                     result = worker.execute_streaming(
-                        code, on_output, store_history, exec_id
+                        code, on_output, store_history, exec_id,
+                        on_stdin_request=on_stdin_request
                     )
                     result_holder[0] = result
                 except Exception as e:
