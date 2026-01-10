@@ -40,6 +40,7 @@ from .types import (
     VariableDetail,
     IsCompleteResult,
     StdinRequest,
+    InputCancelledError,
 )
 
 
@@ -757,7 +758,9 @@ class IPythonWorker:
 
         # Hook builtins.input for stdin support
         import builtins
+        import getpass as getpass_module
         original_input = builtins.input
+        original_getpass = getpass_module.getpass
 
         def hooked_input(prompt=""):
             """Custom input() that uses the stdin callback."""
@@ -791,7 +794,38 @@ class IPythonWorker:
             # Return without trailing newline (like real input())
             return response.rstrip('\n')
 
+        def hooked_getpass(prompt="Password: ", stream=None):
+            """Custom getpass() that uses the stdin callback with password=True."""
+            if on_stdin_request is None:
+                raise RuntimeError(
+                    "getpass() is not supported in this execution context. "
+                    "The client must provide stdin support."
+                )
+
+            # Flush stdout so prompt appears before we request input
+            sys.stdout.write(prompt)
+            sys.stdout.flush()
+
+            # Create stdin request with password=True
+            request = StdinRequest(
+                prompt=prompt,
+                password=True,
+                execId=exec_id or ""
+            )
+
+            # Call the callback and wait for response
+            response = on_stdin_request(request)
+
+            # DON'T echo password input (unlike regular input)
+            # Just write a newline to move to next line
+            sys.stdout.write('\n')
+            sys.stdout.flush()
+
+            # Return without trailing newline
+            return response.rstrip('\n')
+
         builtins.input = hooked_input
+        getpass_module.getpass = hooked_getpass
 
         try:
             exec_result = self.shell.run_cell(code, store_history=store_history, silent=False)
@@ -833,13 +867,26 @@ class IPythonWorker:
                 type="KeyboardInterrupt", message="Interrupted"
             )
             result.success = False
+        except InputCancelledError:
+            # User cancelled input - not an error, just stop execution cleanly
+            result.error = ExecuteError(
+                type="InputCancelled", message="Input cancelled by user"
+            )
+            result.success = False
         except Exception as e:
-            result.error = self._format_exception(e)
+            # Check if this is an InputCancelledError wrapped in another exception
+            if "Input cancelled" in str(e) or isinstance(e.__cause__, InputCancelledError):
+                result.error = ExecuteError(
+                    type="InputCancelled", message="Input cancelled by user"
+                )
+            else:
+                result.error = self._format_exception(e)
             result.success = False
 
         finally:
-            # Restore original input function
+            # Restore original input and getpass functions
             builtins.input = original_input
+            getpass_module.getpass = original_getpass
 
             sys.stdout.flush()
             sys.stderr.flush()

@@ -42,6 +42,7 @@ from .types import (
     CapabilityFeatures,
     Environment,
     ExecuteResult,
+    InputCancelledError,
 )
 
 
@@ -106,6 +107,23 @@ class SessionManager:
             future = self._pending_inputs.pop(exec_id)
             if not future.done():
                 future.get_loop().call_soon_threadsafe(future.set_result, text)
+                return True
+        return False
+
+    def cancel_pending_input(self, exec_id: str) -> bool:
+        """Cancel a pending input request.
+
+        This is called when the user dismisses the input field (e.g., cancels
+        execution, navigates away) to unblock the waiting worker thread.
+        """
+        if exec_id in self._pending_inputs:
+            future = self._pending_inputs.pop(exec_id)
+            if not future.done():
+                # Set exception to unblock the waiting worker
+                future.get_loop().call_soon_threadsafe(
+                    future.set_exception,
+                    InputCancelledError("Input cancelled by user")
+                )
                 return True
         return False
 
@@ -292,6 +310,9 @@ class MRPServer:
                     # Wait up to 5 minutes for input
                     response = concurrent_future.result(timeout=300)
                     return response
+                except InputCancelledError:
+                    # Re-raise InputCancelledError so the worker can handle it
+                    raise
                 except Exception as e:
                     raise RuntimeError(f"Failed to get input: {e}")
 
@@ -364,6 +385,19 @@ class MRPServer:
         if self.session_manager.provide_input(exec_id, text):
             return JSONResponse({"accepted": True})
         return JSONResponse({"accepted": False, "error": "No pending input request"})
+
+    async def handle_input_cancel(self, request: Request) -> JSONResponse:
+        """POST /input/cancel - Cancel pending input request
+
+        Called when the user dismisses the input field without providing input.
+        This unblocks the waiting execution and marks it as cancelled.
+        """
+        body = await request.json()
+        exec_id = body.get("exec_id", "")
+
+        if self.session_manager.cancel_pending_input(exec_id):
+            return JSONResponse({"cancelled": True})
+        return JSONResponse({"cancelled": False, "error": "No pending input request"})
 
     async def handle_interrupt(self, request: Request) -> JSONResponse:
         """POST /interrupt"""
@@ -511,6 +545,7 @@ class MRPServer:
             Route("/mrp/v1/execute", self.handle_execute, methods=["POST"]),
             Route("/mrp/v1/execute/stream", self.handle_execute_stream, methods=["POST"]),
             Route("/mrp/v1/input", self.handle_input, methods=["POST"]),
+            Route("/mrp/v1/input/cancel", self.handle_input_cancel, methods=["POST"]),
             Route("/mrp/v1/interrupt", self.handle_interrupt, methods=["POST"]),
             Route("/mrp/v1/complete", self.handle_complete, methods=["POST"]),
             Route("/mrp/v1/inspect", self.handle_inspect, methods=["POST"]),

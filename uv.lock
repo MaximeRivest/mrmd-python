@@ -288,6 +288,7 @@ name = "mrmd-python"
 version = "0.1.0"
 source = { editable = "." }
 dependencies = [
+    { name = "black" },
     { name = "ipython", version = "8.38.0", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
     { name = "ipython", version = "9.9.0", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.11'" },
     { name = "jedi" },
@@ -308,6 +309,7 @@ format = [
 
 [package.metadata]
 requires-dist = [
+    { name = "black", specifier = ">=25.12.0" },
     { name = "black", marker = "extra == 'format'", specifier = ">=24.0.0" },
     { name = "httpx", marker = "extra == 'dev'", specifier = ">=0.27.0" },
     { name = "ipython", specifier = ">=8.0.0" },

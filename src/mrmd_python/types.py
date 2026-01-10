@@ -233,3 +233,13 @@ class StdinRequest:
     prompt: str = ""
     password: bool = False
     execId: str = ""
+
+
+# =============================================================================
+# Exceptions
+# =============================================================================
+
+
+class InputCancelledError(Exception):
+    """Raised when user cancels input request."""
+    pass
