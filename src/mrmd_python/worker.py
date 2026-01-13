@@ -64,11 +64,14 @@ class IPythonWorker:
     IPython worker that executes code and provides IDE features.
 
     Designed to be used by an HTTP server, not as a subprocess.
+    When a custom venv is specified, execution happens via subprocess
+    using the venv's Python interpreter.
     """
 
-    def __init__(self, cwd: str | None = None, assets_dir: str | None = None):
+    def __init__(self, cwd: str | None = None, assets_dir: str | None = None, venv: str | None = None):
         self.cwd = cwd
         self.assets_dir = assets_dir
+        self.venv = venv
         self.shell = None
         self._initialized = False
         self._captured_displays: list[dict] = []
@@ -78,6 +81,19 @@ class IPythonWorker:
         self._pending_input: dict | None = None  # For stdin_request handling
         self._input_event: threading.Event | None = None
         self._input_response: str | None = None
+        self._execution_count = 0
+        self._subprocess_globals: dict = {}  # Simulated globals for subprocess mode
+
+    def _get_venv_python(self) -> str | None:
+        """Get the Python executable path for the configured venv."""
+        if not self.venv:
+            return None
+        venv_path = Path(self.venv)
+        if sys.platform == 'win32':
+            python_exe = venv_path / 'Scripts' / 'python.exe'
+        else:
+            python_exe = venv_path / 'bin' / 'python'
+        return str(python_exe) if python_exe.exists() else None
 
     def _ensure_initialized(self):
         """Lazy initialization of IPython shell."""
@@ -568,6 +584,205 @@ class IPythonWorker:
     # =========================================================================
     # Execution
     # =========================================================================
+
+    def _execute_subprocess(
+        self, code: str, exec_id: str | None = None
+    ) -> ExecuteResult:
+        """Execute code in a subprocess using the configured venv's Python."""
+        import subprocess
+        import json
+
+        python_exe = self._get_venv_python()
+        if not python_exe:
+            return ExecuteResult(
+                success=False,
+                error=ExecuteError(
+                    ename="VenvError",
+                    evalue="Could not find Python executable in venv",
+                    traceback=[]
+                )
+            )
+
+        self._execution_count += 1
+        start_time = time.time()
+
+        # Create a wrapper script that executes the code and captures output
+        wrapper_code = '''
+import sys
+import json
+
+# Execute the user's code
+_mrmd_result = None
+_mrmd_error = None
+_mrmd_stdout = ""
+
+try:
+    exec(compile("""''' + code.replace('\\', '\\\\').replace('"""', '\\"\\"\\"') + '''""", "<cell>", "exec"))
+except Exception as e:
+    import traceback
+    _mrmd_error = {
+        "ename": type(e).__name__,
+        "evalue": str(e),
+        "traceback": traceback.format_exception(type(e), e, e.__traceback__)
+    }
+'''
+
+        try:
+            result = subprocess.run(
+                [python_exe, "-c", wrapper_code],
+                capture_output=True,
+                text=True,
+                timeout=300,  # 5 minute timeout
+                cwd=self.cwd,
+            )
+
+            duration = int((time.time() - start_time) * 1000)
+
+            if result.returncode == 0:
+                return ExecuteResult(
+                    success=True,
+                    stdout=result.stdout,
+                    stderr=result.stderr,
+                    executionCount=self._execution_count,
+                    duration=duration,
+                )
+            else:
+                # Parse error from stderr if possible
+                error_lines = result.stderr.strip().split('\n') if result.stderr else []
+                return ExecuteResult(
+                    success=False,
+                    stdout=result.stdout,
+                    stderr=result.stderr,
+                    error=ExecuteError(
+                        ename="ExecutionError",
+                        evalue=error_lines[-1] if error_lines else "Unknown error",
+                        traceback=error_lines
+                    ),
+                    executionCount=self._execution_count,
+                    duration=duration,
+                )
+
+        except subprocess.TimeoutExpired:
+            return ExecuteResult(
+                success=False,
+                error=ExecuteError(
+                    ename="TimeoutError",
+                    evalue="Execution timed out after 5 minutes",
+                    traceback=[]
+                ),
+                executionCount=self._execution_count,
+            )
+        except Exception as e:
+            return ExecuteResult(
+                success=False,
+                error=ExecuteError(
+                    ename=type(e).__name__,
+                    evalue=str(e),
+                    traceback=[]
+                ),
+                executionCount=self._execution_count,
+            )
+
+    def _execute_subprocess_streaming(
+        self,
+        code: str,
+        on_output: Callable[[str, str, str], None],
+        exec_id: str | None = None,
+    ) -> ExecuteResult:
+        """Execute code in subprocess with streaming output."""
+        import subprocess
+
+        python_exe = self._get_venv_python()
+        if not python_exe:
+            return ExecuteResult(
+                success=False,
+                error=ExecuteError(
+                    ename="VenvError",
+                    evalue="Could not find Python executable in venv",
+                    traceback=[]
+                )
+            )
+
+        self._execution_count += 1
+        start_time = time.time()
+        accumulated_stdout = ""
+        accumulated_stderr = ""
+
+        try:
+            # Start subprocess
+            process = subprocess.Popen(
+                [python_exe, "-c", code],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                cwd=self.cwd,
+            )
+
+            # Read output in real-time
+            import selectors
+            sel = selectors.DefaultSelector()
+            sel.register(process.stdout, selectors.EVENT_READ)
+            sel.register(process.stderr, selectors.EVENT_READ)
+
+            while process.poll() is None or sel.get_map():
+                for key, _ in sel.select(timeout=0.1):
+                    data = key.fileobj.read(1)
+                    if not data:
+                        sel.unregister(key.fileobj)
+                        continue
+                    if key.fileobj == process.stdout:
+                        accumulated_stdout += data
+                        on_output("stdout", data, accumulated_stdout)
+                    else:
+                        accumulated_stderr += data
+                        on_output("stderr", data, accumulated_stderr)
+
+            # Read any remaining output
+            remaining_stdout = process.stdout.read()
+            remaining_stderr = process.stderr.read()
+            if remaining_stdout:
+                accumulated_stdout += remaining_stdout
+                on_output("stdout", remaining_stdout, accumulated_stdout)
+            if remaining_stderr:
+                accumulated_stderr += remaining_stderr
+                on_output("stderr", remaining_stderr, accumulated_stderr)
+
+            duration = int((time.time() - start_time) * 1000)
+            success = process.returncode == 0
+
+            if not success:
+                error_lines = accumulated_stderr.strip().split('\n') if accumulated_stderr else []
+                return ExecuteResult(
+                    success=False,
+                    stdout=accumulated_stdout,
+                    stderr=accumulated_stderr,
+                    error=ExecuteError(
+                        ename="ExecutionError",
+                        evalue=error_lines[-1] if error_lines else "Unknown error",
+                        traceback=error_lines
+                    ),
+                    executionCount=self._execution_count,
+                    duration=duration,
+                )
+
+            return ExecuteResult(
+                success=True,
+                stdout=accumulated_stdout,
+                stderr=accumulated_stderr,
+                executionCount=self._execution_count,
+                duration=duration,
+            )
+
+        except Exception as e:
+            return ExecuteResult(
+                success=False,
+                error=ExecuteError(
+                    ename=type(e).__name__,
+                    evalue=str(e),
+                    traceback=[]
+                ),
+                executionCount=self._execution_count,
+            )
 
     def execute(
         self, code: str, store_history: bool = True, exec_id: str | None = None

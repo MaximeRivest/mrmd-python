@@ -49,9 +49,10 @@ from .types import (
 class SessionManager:
     """Manages multiple IPython sessions."""
 
-    def __init__(self, cwd: str | None = None, assets_dir: str | None = None):
+    def __init__(self, cwd: str | None = None, assets_dir: str | None = None, venv: str | None = None):
         self.cwd = cwd
         self.assets_dir = assets_dir
+        self.venv = venv
         self.sessions: dict[str, dict] = {}
         self.workers: dict[str, IPythonWorker] = {}
         self._pending_inputs: dict[str, asyncio.Future] = {}
@@ -70,7 +71,7 @@ class SessionManager:
                     "variableCount": 0,
                 }
                 self.workers[session_id] = IPythonWorker(
-                    cwd=self.cwd, assets_dir=self.assets_dir
+                    cwd=self.cwd, assets_dir=self.assets_dir, venv=self.venv
                 )
 
             session = self.sessions[session_id]
@@ -135,11 +136,13 @@ class MRPServer:
         self,
         cwd: str | None = None,
         assets_dir: str | None = None,
+        venv: str | None = None,
     ):
         self.cwd = cwd or os.getcwd()
         self.assets_dir = assets_dir or os.path.join(self.cwd, ".mrmd-assets")
+        self.venv = venv
         self.session_manager = SessionManager(
-            cwd=self.cwd, assets_dir=self.assets_dir
+            cwd=self.cwd, assets_dir=self.assets_dir, venv=venv
         )
 
     def get_capabilities(self) -> Capabilities:
@@ -167,7 +170,7 @@ class MRPServer:
             environment=Environment(
                 cwd=self.cwd,
                 executable=sys.executable,
-                virtualenv=os.environ.get("VIRTUAL_ENV"),
+                virtualenv=self.venv or os.environ.get("VIRTUAL_ENV"),
             ),
         )
 
@@ -577,9 +580,17 @@ def _dataclass_to_dict(obj: Any) -> dict:
 def create_app(
     cwd: str | None = None,
     assets_dir: str | None = None,
+    venv: str | None = None,
 ) -> Starlette:
-    """Create the MRP server application."""
-    server = MRPServer(cwd=cwd, assets_dir=assets_dir)
+    """Create the MRP server application.
+
+    Args:
+        cwd: Working directory for code execution
+        assets_dir: Directory for saving assets (plots, etc.)
+        venv: Path to virtual environment to use for code execution.
+              If provided, packages from this venv will be available.
+    """
+    server = MRPServer(cwd=cwd, assets_dir=assets_dir, venv=venv)
 
     middleware = [
         Middleware(

@@ -39,6 +39,11 @@ def main():
         action="store_true",
         help="Enable auto-reload for development",
     )
+    parser.add_argument(
+        "--venv",
+        default=None,
+        help="Path to virtual environment to use for code execution",
+    )
 
     args = parser.parse_args()
 
@@ -48,7 +53,9 @@ def main():
 
     cwd = args.cwd or os.getcwd()
     assets_dir = args.assets_dir or os.path.join(cwd, ".mrmd-assets")
+    venv = args.venv
 
+    venv_display = venv[:43] if venv else "System Python"
     print(
         f"""
 ╔═══════════════════════════════════════════════════════════════╗
@@ -68,6 +75,7 @@ def main():
 ║                                                               ║
 ║  Working directory: {cwd[:43]:<43}║
 ║  Assets directory:  {assets_dir[:43]:<43}║
+║  Virtual env:       {venv_display:<43}║
 ║                                                               ║
 ║  Press Ctrl+C to stop                                         ║
 ╚═══════════════════════════════════════════════════════════════╝
@@ -76,9 +84,13 @@ def main():
 
     # Create app factory for uvicorn
     def app_factory():
-        return create_app(cwd=cwd, assets_dir=assets_dir)
+        return create_app(cwd=cwd, assets_dir=assets_dir, venv=venv)
 
     if args.reload:
+        global _cwd, _assets_dir, _venv
+        _cwd = cwd
+        _assets_dir = assets_dir
+        _venv = venv
         uvicorn.run(
             "mrmd_python.cli:_create_app_for_reload",
             host=args.host,
@@ -87,19 +99,20 @@ def main():
             access_log=False,  # Disable access log to prevent it leaking into execution output
         )
     else:
-        app = create_app(cwd=cwd, assets_dir=assets_dir)
+        app = create_app(cwd=cwd, assets_dir=assets_dir, venv=venv)
         uvicorn.run(app, host=args.host, port=args.port, access_log=False)
 
 
 # For reload mode
 _cwd = None
 _assets_dir = None
+_venv = None
 
 
 def _create_app_for_reload():
     from .server import create_app
 
-    return create_app(cwd=_cwd, assets_dir=_assets_dir)
+    return create_app(cwd=_cwd, assets_dir=_assets_dir, venv=_venv)
 
 
 if __name__ == "__main__":
