@@ -657,24 +657,36 @@ class IPythonWorker:
         start_time = time.time()
 
         # Create a wrapper script that executes the code and captures output
+        # Uses AST to detect trailing expressions and print their results like IPython
         wrapper_code = '''
-import sys
-import json
+import sys as _sys
+import ast as _ast
 
-# Execute the user's code
-_mrmd_result = None
-_mrmd_error = None
-_mrmd_stdout = ""
+_code = """ ''' + code.replace('\\', '\\\\').replace('"""', '\\"\\"\\"') + ''' """
 
 try:
-    exec(compile("""''' + code.replace('\\', '\\\\').replace('"""', '\\"\\"\\"') + '''""", "<cell>", "exec"))
-except Exception as e:
-    import traceback
-    _mrmd_error = {
-        "ename": type(e).__name__,
-        "evalue": str(e),
-        "traceback": traceback.format_exception(type(e), e, e.__traceback__)
-    }
+    _tree = _ast.parse(_code)
+    if _tree.body and isinstance(_tree.body[-1], _ast.Expr):
+        # Last statement is an expression - capture its value
+        if len(_tree.body) > 1:
+            # Execute all but last statement
+            _exec_code = _ast.Module(body=_tree.body[:-1], type_ignores=[])
+            exec(compile(_exec_code, "<cell>", "exec"))
+        # Evaluate and print last expression
+        _expr_code = _ast.Expression(body=_tree.body[-1].value)
+        _result = eval(compile(_expr_code, "<cell>", "eval"))
+        if _result is not None:
+            print(f"Out[''' + str(self._execution_count) + ''']: " + repr(_result))
+    else:
+        # No trailing expression, just exec everything
+        exec(compile(_code, "<cell>", "exec"))
+except SyntaxError:
+    # Fall back to simple exec
+    exec(compile(_code, "<cell>", "exec"))
+except Exception as _e:
+    import traceback as _tb
+    print("".join(_tb.format_exception(type(_e), _e, _e.__traceback__)), file=_sys.stderr)
+    _sys.exit(1)
 '''
 
         try:
@@ -742,7 +754,11 @@ except Exception as e:
         """Execute code in subprocess with streaming output."""
         import subprocess
 
+        print(f"[IPythonWorker._execute_subprocess_streaming] Starting subprocess execution", flush=True)
+
         python_exe = self._get_venv_python()
+        print(f"[IPythonWorker._execute_subprocess_streaming] python_exe={python_exe}", flush=True)
+
         if not python_exe:
             return ExecuteResult(
                 success=False,
@@ -758,10 +774,42 @@ except Exception as e:
         accumulated_stdout = ""
         accumulated_stderr = ""
 
+        # Wrap code to capture expression results like IPython does
+        # This handles cases like "import sys; sys.executable" which need to print
+        wrapper_code = '''
+import sys as _sys
+import ast as _ast
+
+_code = """ ''' + code.replace('\\', '\\\\').replace('"""', '\\"\\"\\"') + ''' """
+
+# Parse to check if last statement is an expression
+try:
+    _tree = _ast.parse(_code)
+    if _tree.body and isinstance(_tree.body[-1], _ast.Expr):
+        # Last statement is an expression - capture its value
+        if len(_tree.body) > 1:
+            # Execute all but last statement
+            _exec_code = _ast.Module(body=_tree.body[:-1], type_ignores=[])
+            exec(compile(_exec_code, "<cell>", "exec"))
+        # Evaluate and print last expression
+        _expr_code = _ast.Expression(body=_tree.body[-1].value)
+        _result = eval(compile(_expr_code, "<cell>", "eval"))
+        if _result is not None:
+            print(f"Out[{''' + str(self._execution_count) + '''}]: " + repr(_result))
+    else:
+        # No trailing expression, just exec everything
+        exec(compile(_code, "<cell>", "exec"))
+except SyntaxError as _e:
+    # Fall back to simple exec for syntax errors in wrapper
+    exec(compile(_code, "<cell>", "exec"))
+'''
+
+        print(f"[IPythonWorker._execute_subprocess_streaming] Running: {python_exe} -c ...", flush=True)
+
         try:
             # Start subprocess
             process = subprocess.Popen(
-                [python_exe, "-c", code],
+                [python_exe, "-c", wrapper_code],
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 text=True,
