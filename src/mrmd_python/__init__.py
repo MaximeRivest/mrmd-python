@@ -12,5 +12,5 @@ Or programmatically:
 from .server import create_app, MRPServer
 from .worker import IPythonWorker
 
-__version__ = "0.1.0"
+__version__ = "0.3.5"
 __all__ = ["create_app", "MRPServer", "IPythonWorker", "__version__"]

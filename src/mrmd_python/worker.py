@@ -42,6 +42,7 @@ from .types import (
     StdinRequest,
     InputCancelledError,
 )
+from .subprocess_manager import SubprocessWorker
 
 
 @dataclass
@@ -82,31 +83,25 @@ class IPythonWorker:
         self._input_event: threading.Event | None = None
         self._input_response: str | None = None
         self._execution_count = 0
-        self._subprocess_globals: dict = {}  # Simulated globals for subprocess mode
+        self._subprocess_worker: SubprocessWorker | None = None  # Persistent subprocess for different venv
 
     def _get_venv_python(self) -> str | None:
         """Get the Python executable path for the configured venv."""
-        print(f"[IPythonWorker._get_venv_python] self.venv={self.venv}", flush=True)
         if not self.venv:
-            print("[IPythonWorker._get_venv_python] -> None (no venv)", flush=True)
             return None
         venv_path = Path(self.venv)
         if sys.platform == 'win32':
             candidates = [venv_path / 'Scripts' / 'python.exe']
         else:
-            # Try both 'python' and 'python3'
             candidates = [
                 venv_path / 'bin' / 'python',
                 venv_path / 'bin' / 'python3',
             ]
 
         for python_exe in candidates:
-            print(f"[IPythonWorker._get_venv_python] Checking {python_exe}...", flush=True)
             if python_exe.exists():
-                print(f"[IPythonWorker._get_venv_python] -> {python_exe} (FOUND)", flush=True)
                 return str(python_exe)
 
-        print("[IPythonWorker._get_venv_python] -> None (no executable found)", flush=True)
         return None
 
     def _should_use_subprocess(self) -> bool:
@@ -117,33 +112,82 @@ class IPythonWorker:
         - The venv differs from the current Python's prefix
         - The venv's Python executable exists
         """
-        # DEBUG LOGGING
-        print(f"[IPythonWorker._should_use_subprocess] self.venv={self.venv}", flush=True)
-        print(f"[IPythonWorker._should_use_subprocess] sys.prefix={sys.prefix}", flush=True)
-
         if not self.venv:
-            print("[IPythonWorker._should_use_subprocess] -> False (no venv configured)", flush=True)
             return False
 
-        # Compare venv path to current Python's prefix
-        # Use realpath to handle symlinks
+        # Compare venv path to current Python's prefix (use realpath to handle symlinks)
         current_prefix = os.path.realpath(sys.prefix)
         target_venv = os.path.realpath(self.venv)
 
-        print(f"[IPythonWorker._should_use_subprocess] current_prefix={current_prefix}", flush=True)
-        print(f"[IPythonWorker._should_use_subprocess] target_venv={target_venv}", flush=True)
-
         if current_prefix == target_venv:
-            print("[IPythonWorker._should_use_subprocess] -> False (same venv)", flush=True)
             return False
 
-        # Also verify the target Python exists
-        python_exe = self._get_venv_python()
-        print(f"[IPythonWorker._should_use_subprocess] python_exe={python_exe}", flush=True)
+        # Verify the target Python exists
+        return self._get_venv_python() is not None
 
-        result = python_exe is not None
-        print(f"[IPythonWorker._should_use_subprocess] -> {result}", flush=True)
-        return result
+    def _ensure_mrmd_python_in_venv(self) -> bool:
+        """Ensure mrmd-python is installed in the target venv.
+
+        Uses uv pip install to add mrmd-python to the venv so that
+        subprocess_worker can be invoked with -m mrmd_python.subprocess_worker.
+
+        Returns True if successful.
+        """
+        import subprocess as sp
+
+        python_exe = self._get_venv_python()
+        if not python_exe:
+            return False
+
+        # Check if mrmd_python is already importable
+        check_result = sp.run(
+            [python_exe, "-c", "import mrmd_python"],
+            capture_output=True,
+            text=True,
+        )
+
+        if check_result.returncode == 0:
+            # Already installed
+            return True
+
+        # Install mrmd-python using uv pip
+        try:
+            install_result = sp.run(
+                ["uv", "pip", "install", "--python", python_exe, "mrmd-python"],
+                capture_output=True,
+                text=True,
+                timeout=120,
+            )
+            return install_result.returncode == 0
+        except (FileNotFoundError, sp.TimeoutExpired):
+            # uv not available or timeout - try pip directly
+            try:
+                install_result = sp.run(
+                    [python_exe, "-m", "pip", "install", "mrmd-python"],
+                    capture_output=True,
+                    text=True,
+                    timeout=120,
+                )
+                return install_result.returncode == 0
+            except (FileNotFoundError, sp.TimeoutExpired):
+                return False
+
+    def _get_subprocess_worker(self) -> SubprocessWorker:
+        """Get or create the subprocess worker for different-venv execution."""
+        if self._subprocess_worker is None or not self._subprocess_worker.is_alive():
+            # Ensure mrmd-python is installed in the target venv
+            if not self._ensure_mrmd_python_in_venv():
+                raise RuntimeError(
+                    f"Could not install mrmd-python in venv {self.venv}. "
+                    "Please install it manually: uv pip install mrmd-python"
+                )
+
+            self._subprocess_worker = SubprocessWorker(
+                venv=self.venv,
+                cwd=self.cwd,
+                assets_dir=self.assets_dir,
+            )
+        return self._subprocess_worker
 
     def _ensure_initialized(self):
         """Lazy initialization of IPython shell."""
@@ -638,103 +682,10 @@ class IPythonWorker:
     def _execute_subprocess(
         self, code: str, exec_id: str | None = None
     ) -> ExecuteResult:
-        """Execute code in a subprocess using the configured venv's Python."""
-        import subprocess
-        import json
-
-        python_exe = self._get_venv_python()
-        if not python_exe:
-            return ExecuteResult(
-                success=False,
-                error=ExecuteError(
-                    type="VenvError",
-                    message="Could not find Python executable in venv",
-                    traceback=[]
-                )
-            )
-
-        self._execution_count += 1
-        start_time = time.time()
-
-        # Create a wrapper script that executes the code and captures output
-        # Uses AST to detect trailing expressions and print their results like IPython
-        # Use .strip() to remove any leading/trailing whitespace from the embedded code
-        wrapper_code = '''
-import sys as _sys
-import ast as _ast
-
-_code = """''' + code.replace('\\', '\\\\').replace('"""', '\\"\\"\\"') + '''""".strip()
-
-try:
-    _tree = _ast.parse(_code)
-    if _tree.body and isinstance(_tree.body[-1], _ast.Expr):
-        # Last statement is an expression - capture its value
-        if len(_tree.body) > 1:
-            # Execute all but last statement
-            _exec_code = _ast.Module(body=_tree.body[:-1], type_ignores=[])
-            exec(compile(_exec_code, "<cell>", "exec"))
-        # Evaluate and print last expression
-        _expr_code = _ast.Expression(body=_tree.body[-1].value)
-        _result = eval(compile(_expr_code, "<cell>", "eval"))
-        if _result is not None:
-            print(f"Out[''' + str(self._execution_count) + ''']: " + repr(_result))
-    else:
-        # No trailing expression, just exec everything
-        exec(compile(_code, "<cell>", "exec"))
-except SyntaxError:
-    # Fall back to simple exec
-    exec(compile(_code, "<cell>", "exec"))
-except Exception as _e:
-    import traceback as _tb
-    print("".join(_tb.format_exception(type(_e), _e, _e.__traceback__)), file=_sys.stderr)
-    _sys.exit(1)
-'''
-
+        """Execute code using the persistent SubprocessWorker (IPython-based)."""
         try:
-            result = subprocess.run(
-                [python_exe, "-c", wrapper_code],
-                capture_output=True,
-                text=True,
-                timeout=300,  # 5 minute timeout
-                cwd=self.cwd,
-            )
-
-            duration = int((time.time() - start_time) * 1000)
-
-            if result.returncode == 0:
-                return ExecuteResult(
-                    success=True,
-                    stdout=result.stdout,
-                    stderr=result.stderr,
-                    executionCount=self._execution_count,
-                    duration=duration,
-                )
-            else:
-                # Parse error from stderr if possible
-                error_lines = result.stderr.strip().split('\n') if result.stderr else []
-                return ExecuteResult(
-                    success=False,
-                    stdout=result.stdout,
-                    stderr=result.stderr,
-                    error=ExecuteError(
-                        type="ExecutionError",
-                        message=error_lines[-1] if error_lines else "Unknown error",
-                        traceback=error_lines
-                    ),
-                    executionCount=self._execution_count,
-                    duration=duration,
-                )
-
-        except subprocess.TimeoutExpired:
-            return ExecuteResult(
-                success=False,
-                error=ExecuteError(
-                    type="TimeoutError",
-                    message="Execution timed out after 5 minutes",
-                    traceback=[]
-                ),
-                executionCount=self._execution_count,
-            )
+            worker = self._get_subprocess_worker()
+            return worker.execute(code, store_history=True, exec_id=exec_id)
         except Exception as e:
             return ExecuteResult(
                 success=False,
@@ -743,7 +694,6 @@ except Exception as _e:
                     message=str(e),
                     traceback=[]
                 ),
-                executionCount=self._execution_count,
             )
 
     def _execute_subprocess_streaming(
@@ -752,127 +702,15 @@ except Exception as _e:
         on_output: Callable[[str, str, str], None],
         exec_id: str | None = None,
     ) -> ExecuteResult:
-        """Execute code in subprocess with streaming output."""
-        import subprocess
-
-        print(f"[IPythonWorker._execute_subprocess_streaming] Starting subprocess execution", flush=True)
-
-        python_exe = self._get_venv_python()
-        print(f"[IPythonWorker._execute_subprocess_streaming] python_exe={python_exe}", flush=True)
-
-        if not python_exe:
-            return ExecuteResult(
-                success=False,
-                error=ExecuteError(
-                    type="VenvError",
-                    message="Could not find Python executable in venv",
-                    traceback=[]
-                )
-            )
-
-        self._execution_count += 1
-        start_time = time.time()
-        accumulated_stdout = ""
-        accumulated_stderr = ""
-
-        # Wrap code to capture expression results like IPython does
-        # This handles cases like "import sys; sys.executable" which need to print
-        # Use .strip() to remove any leading/trailing whitespace from the embedded code
-        wrapper_code = '''
-import sys as _sys
-import ast as _ast
-
-_code = """''' + code.replace('\\', '\\\\').replace('"""', '\\"\\"\\"') + '''""".strip()
-
-# Parse to check if last statement is an expression
-try:
-    _tree = _ast.parse(_code)
-    if _tree.body and isinstance(_tree.body[-1], _ast.Expr):
-        # Last statement is an expression - capture its value
-        if len(_tree.body) > 1:
-            # Execute all but last statement
-            _exec_code = _ast.Module(body=_tree.body[:-1], type_ignores=[])
-            exec(compile(_exec_code, "<cell>", "exec"))
-        # Evaluate and print last expression
-        _expr_code = _ast.Expression(body=_tree.body[-1].value)
-        _result = eval(compile(_expr_code, "<cell>", "eval"))
-        if _result is not None:
-            print(f"Out[{''' + str(self._execution_count) + '''}]: " + repr(_result))
-    else:
-        # No trailing expression, just exec everything
-        exec(compile(_code, "<cell>", "exec"))
-except SyntaxError as _e:
-    # Fall back to simple exec for syntax errors in wrapper
-    exec(compile(_code, "<cell>", "exec"))
-'''
-
-        print(f"[IPythonWorker._execute_subprocess_streaming] Running: {python_exe} -c ...", flush=True)
-
+        """Execute code using the persistent SubprocessWorker with streaming."""
         try:
-            # Start subprocess
-            process = subprocess.Popen(
-                [python_exe, "-c", wrapper_code],
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-                cwd=self.cwd,
+            worker = self._get_subprocess_worker()
+            return worker.execute_streaming(
+                code,
+                on_output=on_output,
+                store_history=True,
+                exec_id=exec_id,
             )
-
-            # Read output in real-time
-            import selectors
-            sel = selectors.DefaultSelector()
-            sel.register(process.stdout, selectors.EVENT_READ)
-            sel.register(process.stderr, selectors.EVENT_READ)
-
-            while process.poll() is None or sel.get_map():
-                for key, _ in sel.select(timeout=0.1):
-                    data = key.fileobj.read(1)
-                    if not data:
-                        sel.unregister(key.fileobj)
-                        continue
-                    if key.fileobj == process.stdout:
-                        accumulated_stdout += data
-                        on_output("stdout", data, accumulated_stdout)
-                    else:
-                        accumulated_stderr += data
-                        on_output("stderr", data, accumulated_stderr)
-
-            # Read any remaining output
-            remaining_stdout = process.stdout.read()
-            remaining_stderr = process.stderr.read()
-            if remaining_stdout:
-                accumulated_stdout += remaining_stdout
-                on_output("stdout", remaining_stdout, accumulated_stdout)
-            if remaining_stderr:
-                accumulated_stderr += remaining_stderr
-                on_output("stderr", remaining_stderr, accumulated_stderr)
-
-            duration = int((time.time() - start_time) * 1000)
-            success = process.returncode == 0
-
-            if not success:
-                error_lines = accumulated_stderr.strip().split('\n') if accumulated_stderr else []
-                return ExecuteResult(
-                    success=False,
-                    stdout=accumulated_stdout,
-                    stderr=accumulated_stderr,
-                    error=ExecuteError(
-                        type="ExecutionError",
-                        message=error_lines[-1] if error_lines else "Unknown error",
-                        traceback=error_lines
-                    ),
-                    executionCount=self._execution_count,
-                    duration=duration,
-                )
-
-            return ExecuteResult(
-                success=True,
-                stdout=accumulated_stdout,
-                stderr=accumulated_stderr,
-                executionCount=self._execution_count,
-                duration=duration,
-            )
-
         except Exception as e:
             return ExecuteResult(
                 success=False,
@@ -881,21 +719,16 @@ except SyntaxError as _e:
                     message=str(e),
                     traceback=[]
                 ),
-                executionCount=self._execution_count,
             )
 
     def execute(
         self, code: str, store_history: bool = True, exec_id: str | None = None
     ) -> ExecuteResult:
         """Execute code and return result (non-streaming)."""
-        print(f"[IPythonWorker.execute] Called with code length={len(code)}", flush=True)
-
         # Use subprocess execution if venv differs from current Python
         if self._should_use_subprocess():
-            print("[IPythonWorker.execute] Using SUBPROCESS execution", flush=True)
             return self._execute_subprocess(code, exec_id)
 
-        print("[IPythonWorker.execute] Using LOCAL execution", flush=True)
         self._ensure_initialized()
         self._captured_displays = []
         self._current_exec_id = exec_id
@@ -979,14 +812,10 @@ except SyntaxError as _e:
         Returns:
             ExecuteResult with final result
         """
-        print(f"[IPythonWorker.execute_streaming] Called with code length={len(code)}", flush=True)
-
         # Use subprocess execution if venv differs from current Python
         if self._should_use_subprocess():
-            print("[IPythonWorker.execute_streaming] Using SUBPROCESS execution", flush=True)
             return self._execute_subprocess_streaming(code, on_output, exec_id)
 
-        print("[IPythonWorker.execute_streaming] Using LOCAL execution", flush=True)
         self._ensure_initialized()
         self._captured_displays = []
         self._current_exec_id = exec_id
@@ -1598,8 +1427,16 @@ except SyntaxError as _e:
 
     def reset(self):
         """Reset the namespace."""
-        self._ensure_initialized()
-        self.shell.reset()
+        if self._subprocess_worker is not None:
+            self._subprocess_worker.reset()
+        elif self._initialized:
+            self.shell.reset()
+
+    def shutdown(self):
+        """Shutdown the worker, cleaning up subprocess if needed."""
+        if self._subprocess_worker is not None:
+            self._subprocess_worker.shutdown()
+            self._subprocess_worker = None
 
     def get_info(self) -> dict:
         """Get info about this worker."""
