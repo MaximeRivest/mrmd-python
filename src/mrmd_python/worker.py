@@ -647,8 +647,8 @@ class IPythonWorker:
             return ExecuteResult(
                 success=False,
                 error=ExecuteError(
-                    ename="VenvError",
-                    evalue="Could not find Python executable in venv",
+                    type="VenvError",
+                    message="Could not find Python executable in venv",
                     traceback=[]
                 )
             )
@@ -658,11 +658,12 @@ class IPythonWorker:
 
         # Create a wrapper script that executes the code and captures output
         # Uses AST to detect trailing expressions and print their results like IPython
+        # Use .strip() to remove any leading/trailing whitespace from the embedded code
         wrapper_code = '''
 import sys as _sys
 import ast as _ast
 
-_code = """ ''' + code.replace('\\', '\\\\').replace('"""', '\\"\\"\\"') + ''' """
+_code = """''' + code.replace('\\', '\\\\').replace('"""', '\\"\\"\\"') + '''""".strip()
 
 try:
     _tree = _ast.parse(_code)
@@ -716,8 +717,8 @@ except Exception as _e:
                     stdout=result.stdout,
                     stderr=result.stderr,
                     error=ExecuteError(
-                        ename="ExecutionError",
-                        evalue=error_lines[-1] if error_lines else "Unknown error",
+                        type="ExecutionError",
+                        message=error_lines[-1] if error_lines else "Unknown error",
                         traceback=error_lines
                     ),
                     executionCount=self._execution_count,
@@ -728,8 +729,8 @@ except Exception as _e:
             return ExecuteResult(
                 success=False,
                 error=ExecuteError(
-                    ename="TimeoutError",
-                    evalue="Execution timed out after 5 minutes",
+                    type="TimeoutError",
+                    message="Execution timed out after 5 minutes",
                     traceback=[]
                 ),
                 executionCount=self._execution_count,
@@ -738,8 +739,8 @@ except Exception as _e:
             return ExecuteResult(
                 success=False,
                 error=ExecuteError(
-                    ename=type(e).__name__,
-                    evalue=str(e),
+                    type=type(e).__name__,
+                    message=str(e),
                     traceback=[]
                 ),
                 executionCount=self._execution_count,
@@ -763,8 +764,8 @@ except Exception as _e:
             return ExecuteResult(
                 success=False,
                 error=ExecuteError(
-                    ename="VenvError",
-                    evalue="Could not find Python executable in venv",
+                    type="VenvError",
+                    message="Could not find Python executable in venv",
                     traceback=[]
                 )
             )
@@ -776,11 +777,12 @@ except Exception as _e:
 
         # Wrap code to capture expression results like IPython does
         # This handles cases like "import sys; sys.executable" which need to print
+        # Use .strip() to remove any leading/trailing whitespace from the embedded code
         wrapper_code = '''
 import sys as _sys
 import ast as _ast
 
-_code = """ ''' + code.replace('\\', '\\\\').replace('"""', '\\"\\"\\"') + ''' """
+_code = """''' + code.replace('\\', '\\\\').replace('"""', '\\"\\"\\"') + '''""".strip()
 
 # Parse to check if last statement is an expression
 try:
@@ -855,8 +857,8 @@ except SyntaxError as _e:
                     stdout=accumulated_stdout,
                     stderr=accumulated_stderr,
                     error=ExecuteError(
-                        ename="ExecutionError",
-                        evalue=error_lines[-1] if error_lines else "Unknown error",
+                        type="ExecutionError",
+                        message=error_lines[-1] if error_lines else "Unknown error",
                         traceback=error_lines
                     ),
                     executionCount=self._execution_count,
@@ -875,8 +877,8 @@ except SyntaxError as _e:
             return ExecuteResult(
                 success=False,
                 error=ExecuteError(
-                    ename=type(e).__name__,
-                    evalue=str(e),
+                    type=type(e).__name__,
+                    message=str(e),
                     traceback=[]
                 ),
                 executionCount=self._execution_count,
