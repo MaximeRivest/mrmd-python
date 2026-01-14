@@ -95,6 +95,29 @@ class IPythonWorker:
             python_exe = venv_path / 'bin' / 'python'
         return str(python_exe) if python_exe.exists() else None
 
+    def _should_use_subprocess(self) -> bool:
+        """Check if we should use subprocess for execution (different venv).
+
+        Returns True if:
+        - A venv is configured
+        - The venv differs from the current Python's prefix
+        - The venv's Python executable exists
+        """
+        if not self.venv:
+            return False
+
+        # Compare venv path to current Python's prefix
+        # Use realpath to handle symlinks
+        current_prefix = os.path.realpath(sys.prefix)
+        target_venv = os.path.realpath(self.venv)
+
+        if current_prefix == target_venv:
+            return False
+
+        # Also verify the target Python exists
+        python_exe = self._get_venv_python()
+        return python_exe is not None
+
     def _ensure_initialized(self):
         """Lazy initialization of IPython shell."""
         if self._initialized:
@@ -788,6 +811,10 @@ except Exception as e:
         self, code: str, store_history: bool = True, exec_id: str | None = None
     ) -> ExecuteResult:
         """Execute code and return result (non-streaming)."""
+        # Use subprocess execution if venv differs from current Python
+        if self._should_use_subprocess():
+            return self._execute_subprocess(code, exec_id)
+
         self._ensure_initialized()
         self._captured_displays = []
         self._current_exec_id = exec_id
@@ -871,6 +898,10 @@ except Exception as e:
         Returns:
             ExecuteResult with final result
         """
+        # Use subprocess execution if venv differs from current Python
+        if self._should_use_subprocess():
+            return self._execute_subprocess_streaming(code, on_output, exec_id)
+
         self._ensure_initialized()
         self._captured_displays = []
         self._current_exec_id = exec_id
