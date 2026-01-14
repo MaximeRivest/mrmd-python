@@ -120,14 +120,25 @@ class SessionManager:
         Returns:
             Tuple of (worker, session_info)
         """
+        print(f"[MRPServer.get_or_create_session] session_id={session_id}", flush=True)
+        print(f"[MRPServer.get_or_create_session] venv param={venv}", flush=True)
+        print(f"[MRPServer.get_or_create_session] self.default_venv={self.default_venv}", flush=True)
+        print(f"[MRPServer.get_or_create_session] _get_current_venv()={_get_current_venv()}", flush=True)
+        print(f"[MRPServer.get_or_create_session] sys.prefix={sys.prefix}", flush=True)
+
         effective_venv = venv or self.default_venv or _get_current_venv() or sys.prefix
         effective_cwd = cwd or self.cwd
 
+        print(f"[MRPServer.get_or_create_session] effective_venv={effective_venv}", flush=True)
+        print(f"[MRPServer.get_or_create_session] daemon_mode={self.daemon_mode}", flush=True)
+
         with self._lock:
             if session_id not in self.sessions:
+                print(f"[MRPServer.get_or_create_session] Creating NEW session", flush=True)
                 if self.daemon_mode:
                     # DAEMON MODE: Use local IPythonWorker
                     # This is the actual execution engine inside the daemon
+                    print(f"[MRPServer.get_or_create_session] Creating IPythonWorker with venv={effective_venv}", flush=True)
                     worker = IPythonWorker(
                         cwd=effective_cwd,
                         assets_dir=self.assets_dir,
@@ -177,6 +188,11 @@ class SessionManager:
                     }
 
                 self.workers[session_id] = worker
+            else:
+                print(f"[MRPServer.get_or_create_session] Using EXISTING session", flush=True)
+                existing_worker = self.workers.get(session_id)
+                if existing_worker and hasattr(existing_worker, 'venv'):
+                    print(f"[MRPServer.get_or_create_session] Existing worker venv={existing_worker.venv}", flush=True)
 
             session = self.sessions[session_id]
             session["lastActivity"] = datetime.now(timezone.utc).isoformat()

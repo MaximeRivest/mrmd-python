@@ -275,8 +275,11 @@ def run_daemon(
 
     print(f"[{datetime.now().isoformat()}] Starting runtime daemon {runtime_id} on port {port}")
     print(f"  PID: {os.getpid()}")
-    print(f"  venv: {venv}")
+    print(f"  venv (param): {venv}")
+    print(f"  sys.prefix (actual Python): {sys.prefix}")
+    print(f"  sys.executable: {sys.executable}")
     print(f"  cwd: {cwd}")
+    print(f"  VENV MISMATCH: {venv != sys.prefix}")
     sys.stdout.flush()
 
     # Import and run the server
@@ -284,9 +287,14 @@ def run_daemon(
     import uvicorn
     from .server import create_app
 
+    print(f"  Calling create_app with venv={venv}, daemon_mode=True")
+    sys.stdout.flush()
+
     # CRITICAL: daemon_mode=True tells the server to use local IPythonWorker
     # instead of spawning more daemons (which would cause infinite recursion)
     app = create_app(cwd=cwd, assets_dir=assets_dir, venv=venv, daemon_mode=True)
+    print(f"  App created successfully")
+    sys.stdout.flush()
 
     # Run uvicorn (this blocks)
     uvicorn.run(

@@ -86,14 +86,28 @@ class IPythonWorker:
 
     def _get_venv_python(self) -> str | None:
         """Get the Python executable path for the configured venv."""
+        print(f"[IPythonWorker._get_venv_python] self.venv={self.venv}", flush=True)
         if not self.venv:
+            print("[IPythonWorker._get_venv_python] -> None (no venv)", flush=True)
             return None
         venv_path = Path(self.venv)
         if sys.platform == 'win32':
-            python_exe = venv_path / 'Scripts' / 'python.exe'
+            candidates = [venv_path / 'Scripts' / 'python.exe']
         else:
-            python_exe = venv_path / 'bin' / 'python'
-        return str(python_exe) if python_exe.exists() else None
+            # Try both 'python' and 'python3'
+            candidates = [
+                venv_path / 'bin' / 'python',
+                venv_path / 'bin' / 'python3',
+            ]
+
+        for python_exe in candidates:
+            print(f"[IPythonWorker._get_venv_python] Checking {python_exe}...", flush=True)
+            if python_exe.exists():
+                print(f"[IPythonWorker._get_venv_python] -> {python_exe} (FOUND)", flush=True)
+                return str(python_exe)
+
+        print("[IPythonWorker._get_venv_python] -> None (no executable found)", flush=True)
+        return None
 
     def _should_use_subprocess(self) -> bool:
         """Check if we should use subprocess for execution (different venv).
@@ -103,7 +117,12 @@ class IPythonWorker:
         - The venv differs from the current Python's prefix
         - The venv's Python executable exists
         """
+        # DEBUG LOGGING
+        print(f"[IPythonWorker._should_use_subprocess] self.venv={self.venv}", flush=True)
+        print(f"[IPythonWorker._should_use_subprocess] sys.prefix={sys.prefix}", flush=True)
+
         if not self.venv:
+            print("[IPythonWorker._should_use_subprocess] -> False (no venv configured)", flush=True)
             return False
 
         # Compare venv path to current Python's prefix
@@ -111,12 +130,20 @@ class IPythonWorker:
         current_prefix = os.path.realpath(sys.prefix)
         target_venv = os.path.realpath(self.venv)
 
+        print(f"[IPythonWorker._should_use_subprocess] current_prefix={current_prefix}", flush=True)
+        print(f"[IPythonWorker._should_use_subprocess] target_venv={target_venv}", flush=True)
+
         if current_prefix == target_venv:
+            print("[IPythonWorker._should_use_subprocess] -> False (same venv)", flush=True)
             return False
 
         # Also verify the target Python exists
         python_exe = self._get_venv_python()
-        return python_exe is not None
+        print(f"[IPythonWorker._should_use_subprocess] python_exe={python_exe}", flush=True)
+
+        result = python_exe is not None
+        print(f"[IPythonWorker._should_use_subprocess] -> {result}", flush=True)
+        return result
 
     def _ensure_initialized(self):
         """Lazy initialization of IPython shell."""
@@ -811,10 +838,14 @@ except Exception as e:
         self, code: str, store_history: bool = True, exec_id: str | None = None
     ) -> ExecuteResult:
         """Execute code and return result (non-streaming)."""
+        print(f"[IPythonWorker.execute] Called with code length={len(code)}", flush=True)
+
         # Use subprocess execution if venv differs from current Python
         if self._should_use_subprocess():
+            print("[IPythonWorker.execute] Using SUBPROCESS execution", flush=True)
             return self._execute_subprocess(code, exec_id)
 
+        print("[IPythonWorker.execute] Using LOCAL execution", flush=True)
         self._ensure_initialized()
         self._captured_displays = []
         self._current_exec_id = exec_id
@@ -898,10 +929,14 @@ except Exception as e:
         Returns:
             ExecuteResult with final result
         """
+        print(f"[IPythonWorker.execute_streaming] Called with code length={len(code)}", flush=True)
+
         # Use subprocess execution if venv differs from current Python
         if self._should_use_subprocess():
+            print("[IPythonWorker.execute_streaming] Using SUBPROCESS execution", flush=True)
             return self._execute_subprocess_streaming(code, on_output, exec_id)
 
+        print("[IPythonWorker.execute_streaming] Using LOCAL execution", flush=True)
         self._ensure_initialized()
         self._captured_displays = []
         self._current_exec_id = exec_id
