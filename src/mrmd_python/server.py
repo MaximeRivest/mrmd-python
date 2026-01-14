@@ -36,7 +36,16 @@ from starlette.middleware import Middleware
 from starlette.middleware.cors import CORSMiddleware
 from sse_starlette.sse import EventSourceResponse
 
+from .runtime_client import DaemonRuntimeClient
+from .runtime_daemon import list_runtimes, is_runtime_alive, kill_runtime
 from .worker import IPythonWorker
+# All sessions use independent daemon runtimes for:
+# - GPU memory isolation (critical for vLLM)
+# - Process survival (daemon persists if orchestrator dies)
+# - Registry in ~/.mrmd/runtimes/ for discovery
+#
+# Exception: When running IN a daemon (daemon_mode=True), we use the local
+# IPythonWorker to avoid recursive daemon spawning.
 from .types import (
     Capabilities,
     CapabilityFeatures,
@@ -46,33 +55,128 @@ from .types import (
 )
 
 
-class SessionManager:
-    """Manages multiple IPython sessions."""
+def _get_current_venv() -> str | None:
+    """Get the current Python's virtual environment path.
 
-    def __init__(self, cwd: str | None = None, assets_dir: str | None = None, venv: str | None = None):
+    Returns sys.prefix if we're in a venv, otherwise None.
+    """
+    # Check if we're in a virtual environment
+    # sys.prefix != sys.base_prefix when in a venv
+    if sys.prefix != sys.base_prefix:
+        return sys.prefix
+    # Also check VIRTUAL_ENV env var
+    return os.environ.get("VIRTUAL_ENV")
+
+
+class SessionManager:
+    """Manages multiple Python sessions.
+
+    Two modes of operation:
+    1. daemon_mode=True: Used when running INSIDE a daemon process.
+       Uses IPythonWorker directly for local execution.
+       This is a single, independent Python runtime.
+
+    2. daemon_mode=False (default): Used by orchestrators.
+       Each session spawns an independent daemon process via DaemonRuntimeClient.
+       Daemons survive if orchestrator dies, variables persist, GPU memory isolated.
+    """
+
+    def __init__(
+        self,
+        cwd: str | None = None,
+        assets_dir: str | None = None,
+        venv: str | None = None,
+        daemon_mode: bool = False,
+    ):
         self.cwd = cwd
         self.assets_dir = assets_dir
-        self.venv = venv
+        self.default_venv = venv
+        self.daemon_mode = daemon_mode
         self.sessions: dict[str, dict] = {}
-        self.workers: dict[str, IPythonWorker] = {}
+        # In daemon_mode: workers dict holds IPythonWorker instances
+        # In orchestrator mode: workers dict holds DaemonRuntimeClient instances
+        self.workers: dict[str, IPythonWorker | DaemonRuntimeClient] = {}
         self._pending_inputs: dict[str, asyncio.Future] = {}
         self._lock = threading.Lock()
 
-    def get_or_create_session(self, session_id: str) -> tuple[IPythonWorker, dict]:
-        """Get or create a session."""
+    def get_or_create_session(
+        self,
+        session_id: str,
+        venv: str | None = None,
+        cwd: str | None = None,
+    ) -> tuple[IPythonWorker | DaemonRuntimeClient, dict]:
+        """
+        Get or create a session.
+
+        Behavior depends on daemon_mode:
+        - daemon_mode=True: Creates local IPythonWorker (for use inside daemon)
+        - daemon_mode=False: Creates DaemonRuntimeClient (spawns independent daemon)
+
+        Args:
+            session_id: Unique session identifier
+            venv: Path to virtual environment. If not provided, auto-detects.
+            cwd: Working directory override for this session.
+
+        Returns:
+            Tuple of (worker, session_info)
+        """
+        effective_venv = venv or self.default_venv or _get_current_venv() or sys.prefix
+        effective_cwd = cwd or self.cwd
+
         with self._lock:
             if session_id not in self.sessions:
-                self.sessions[session_id] = {
-                    "id": session_id,
-                    "language": "python",
-                    "created": datetime.now(timezone.utc).isoformat(),
-                    "lastActivity": datetime.now(timezone.utc).isoformat(),
-                    "executionCount": 0,
-                    "variableCount": 0,
-                }
-                self.workers[session_id] = IPythonWorker(
-                    cwd=self.cwd, assets_dir=self.assets_dir, venv=self.venv
-                )
+                if self.daemon_mode:
+                    # DAEMON MODE: Use local IPythonWorker
+                    # This is the actual execution engine inside the daemon
+                    worker = IPythonWorker(
+                        cwd=effective_cwd,
+                        assets_dir=self.assets_dir,
+                        venv=effective_venv,
+                    )
+                    self.sessions[session_id] = {
+                        "id": session_id,
+                        "language": "python",
+                        "created": datetime.now(timezone.utc).isoformat(),
+                        "lastActivity": datetime.now(timezone.utc).isoformat(),
+                        "executionCount": 0,
+                        "variableCount": 0,
+                        "workerType": "local",  # Local IPython worker
+                        "environment": {
+                            "cwd": effective_cwd,
+                            "virtualenv": effective_venv,
+                        },
+                    }
+                else:
+                    # ORCHESTRATOR MODE: Spawn independent daemon via HTTP client
+                    client = DaemonRuntimeClient(
+                        runtime_id=session_id,
+                        venv=effective_venv,
+                        cwd=effective_cwd,
+                        assets_dir=self.assets_dir,
+                        auto_spawn=True,
+                    )
+                    daemon_info = client.get_info()
+                    worker = client
+                    self.sessions[session_id] = {
+                        "id": session_id,
+                        "language": "python",
+                        "created": datetime.now(timezone.utc).isoformat(),
+                        "lastActivity": datetime.now(timezone.utc).isoformat(),
+                        "executionCount": 0,
+                        "variableCount": 0,
+                        "workerType": "daemon",  # Independent daemon process
+                        "daemon": {
+                            "pid": daemon_info.get("pid"),
+                            "port": daemon_info.get("port"),
+                            "url": daemon_info.get("url"),
+                        },
+                        "environment": {
+                            "cwd": effective_cwd,
+                            "virtualenv": effective_venv,
+                        },
+                    }
+
+                self.workers[session_id] = worker
 
             session = self.sessions[session_id]
             session["lastActivity"] = datetime.now(timezone.utc).isoformat()
@@ -87,14 +191,31 @@ class SessionManager:
         return list(self.sessions.values())
 
     def destroy_session(self, session_id: str) -> bool:
-        """Destroy a session."""
+        """
+        Destroy a session and release all resources.
+
+        In daemon mode: Resets the local IPythonWorker
+        In orchestrator mode: Kills the daemon process, releasing GPU/VRAM
+        """
         with self._lock:
             if session_id in self.sessions:
-                del self.sessions[session_id]
                 if session_id in self.workers:
+                    worker = self.workers[session_id]
+                    if hasattr(worker, 'shutdown'):
+                        worker.shutdown()  # DaemonRuntimeClient - kills daemon
+                    elif hasattr(worker, 'reset'):
+                        worker.reset()  # IPythonWorker - just reset
                     del self.workers[session_id]
+
+                del self.sessions[session_id]
                 return True
             return False
+
+    def get_worker_info(self, session_id: str) -> dict | None:
+        """Get info about the worker for a session."""
+        if session_id not in self.workers:
+            return None
+        return self.workers[session_id].get_info()
 
     def register_pending_input(self, exec_id: str, loop: asyncio.AbstractEventLoop) -> asyncio.Future:
         """Register that an execution is waiting for input."""
@@ -137,12 +258,17 @@ class MRPServer:
         cwd: str | None = None,
         assets_dir: str | None = None,
         venv: str | None = None,
+        daemon_mode: bool = False,
     ):
         self.cwd = cwd or os.getcwd()
         self.assets_dir = assets_dir or os.path.join(self.cwd, ".mrmd-assets")
         self.venv = venv
+        self.daemon_mode = daemon_mode
         self.session_manager = SessionManager(
-            cwd=self.cwd, assets_dir=self.assets_dir, venv=venv
+            cwd=self.cwd,
+            assets_dir=self.assets_dir,
+            venv=venv,
+            daemon_mode=daemon_mode,
         )
 
     def get_capabilities(self) -> Capabilities:
@@ -189,10 +315,33 @@ class MRPServer:
         return JSONResponse({"sessions": sessions})
 
     async def handle_create_session(self, request: Request) -> JSONResponse:
-        """POST /sessions"""
+        """POST /sessions
+
+        Create a new session with optional environment configuration.
+
+        Request body:
+            id: Optional session ID (generated if not provided)
+            language: Language (default: python)
+            environment:
+                cwd: Working directory
+                virtualenv: Path to venv (enables subprocess isolation)
+                executable: Python executable (ignored, derived from venv)
+                env: Environment variables (not yet implemented)
+            dependencies: Package dependencies (not yet implemented)
+        """
         body = await request.json()
         session_id = body.get("id", str(uuid.uuid4())[:8])
-        worker, session = self.session_manager.get_or_create_session(session_id)
+
+        # Extract environment config
+        env_config = body.get("environment", {})
+        venv = env_config.get("virtualenv")
+        cwd = env_config.get("cwd")
+
+        worker, session = self.session_manager.get_or_create_session(
+            session_id,
+            venv=venv,
+            cwd=cwd,
+        )
         return JSONResponse(session)
 
     async def handle_get_session(self, request: Request) -> JSONResponse:
@@ -581,6 +730,7 @@ def create_app(
     cwd: str | None = None,
     assets_dir: str | None = None,
     venv: str | None = None,
+    daemon_mode: bool = False,
 ) -> Starlette:
     """Create the MRP server application.
 
@@ -588,9 +738,10 @@ def create_app(
         cwd: Working directory for code execution
         assets_dir: Directory for saving assets (plots, etc.)
         venv: Path to virtual environment to use for code execution.
-              If provided, packages from this venv will be available.
+        daemon_mode: If True, use local IPythonWorker (for daemon process).
+                    If False, spawn independent daemon processes for each session.
     """
-    server = MRPServer(cwd=cwd, assets_dir=assets_dir, venv=venv)
+    server = MRPServer(cwd=cwd, assets_dir=assets_dir, venv=venv, daemon_mode=daemon_mode)
 
     middleware = [
         Middleware(
