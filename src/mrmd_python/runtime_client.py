@@ -401,6 +401,18 @@ class DaemonRuntimeClient:
         """Check if the daemon runtime is still running."""
         return is_runtime_alive(self.runtime_id)
 
+    def interrupt(self) -> bool:
+        """Interrupt currently running code in the daemon.
+
+        Sends interrupt request to the daemon via HTTP.
+        Returns True if request was sent successfully.
+        """
+        try:
+            result = self._post("/mrp/v1/interrupt", {"session": "default"})
+            return result.get("interrupted", False)
+        except Exception:
+            return False
+
     def _parse_execute_result(self, data: dict) -> ExecuteResult:
         """Parse execute result from HTTP response."""
         error = None

@@ -568,9 +568,29 @@ class MRPServer:
         return JSONResponse({"cancelled": False, "error": "No pending input request"})
 
     async def handle_interrupt(self, request: Request) -> JSONResponse:
-        """POST /interrupt"""
-        # TODO: Implement actual interrupt via signal
-        return JSONResponse({"interrupted": True})
+        """POST /interrupt
+
+        Interrupt currently running code in a session.
+        Sends SIGINT to subprocess workers or sets interrupt flag for local workers.
+        """
+        body = await request.json()
+        session_id = body.get("session", "default")
+
+        # Get the worker for this session (don't create if doesn't exist)
+        session = self.session_manager.get_session(session_id)
+        if not session:
+            return JSONResponse({"interrupted": False, "error": "Session not found"})
+
+        worker = self.session_manager.workers.get(session_id)
+        if not worker:
+            return JSONResponse({"interrupted": False, "error": "Worker not found"})
+
+        # Call interrupt on the worker
+        try:
+            interrupted = worker.interrupt()
+            return JSONResponse({"interrupted": interrupted})
+        except Exception as e:
+            return JSONResponse({"interrupted": False, "error": str(e)})
 
     async def handle_complete(self, request: Request) -> JSONResponse:
         """POST /complete"""

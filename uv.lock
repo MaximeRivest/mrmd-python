@@ -285,7 +285,7 @@ wheels = [
 
 [[package]]
 name = "mrmd-python"
-version = "0.2.0"
+version = "0.3.6"
 source = { editable = "." }
 dependencies = [
     { name = "black" },

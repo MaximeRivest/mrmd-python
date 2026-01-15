@@ -419,6 +419,20 @@ class SubprocessWorker:
                 self._started = False
                 self._pid = None
 
+    def interrupt(self) -> bool:
+        """Send SIGINT to the subprocess to raise KeyboardInterrupt.
+
+        Returns True if signal was sent successfully.
+        """
+        if self._process and self._process.poll() is None:
+            try:
+                import signal
+                self._process.send_signal(signal.SIGINT)
+                return True
+            except Exception:
+                pass
+        return False
+
     def is_alive(self) -> bool:
         """Check if subprocess is still running."""
         return self._process is not None and self._process.poll() is None

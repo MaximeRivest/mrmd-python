@@ -1438,6 +1438,22 @@ class IPythonWorker:
             self._subprocess_worker.shutdown()
             self._subprocess_worker = None
 
+    def interrupt(self) -> bool:
+        """Interrupt currently running code.
+
+        For subprocess workers, sends SIGINT.
+        For local execution, sets interrupt flag (checked in callbacks).
+
+        Returns True if interrupt was initiated.
+        """
+        if self._subprocess_worker is not None:
+            return self._subprocess_worker.interrupt()
+
+        # For local execution, set the interrupt flag
+        # This will be checked by long-running operations
+        self._interrupt_requested = True
+        return True
+
     def get_info(self) -> dict:
         """Get info about this worker."""
         return {
