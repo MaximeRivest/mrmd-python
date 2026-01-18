@@ -407,13 +407,16 @@ class MRPServer:
 
     async def handle_execute_stream(self, request: Request) -> EventSourceResponse:
         """POST /execute/stream - SSE streaming execution"""
+        print(f"[DEBUG] handle_execute_stream called", flush=True)
         body = await request.json()
         code = body.get("code", "")
         session_id = body.get("session", "default")
         store_history = body.get("storeHistory", True)
         exec_id = body.get("execId", str(uuid.uuid4())[:8])
+        print(f"[DEBUG] session_id={session_id}, code length={len(code)}, exec_id={exec_id}", flush=True)
 
         worker, session = self.session_manager.get_or_create_session(session_id)
+        print(f"[DEBUG] Got worker, starting event generator", flush=True)
 
         async def event_generator():
             # Capture the event loop for use in background threads
