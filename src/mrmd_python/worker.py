@@ -1141,9 +1141,21 @@ class IPythonWorker:
             if not name:
                 return InspectResult(found=False)
 
-            info = self.shell.object_inspect(name)
+            # detail_level=1 tells IPython to include source code
+            ipython_detail = 1 if detail >= 2 else 0
+            info = self.shell.object_inspect(name, detail_level=ipython_detail)
             if not info.get("found"):
                 return InspectResult(found=False, name=name)
+
+            # If IPython didn't get source, try inspect.getsource() directly
+            source_code = info.get("source")
+            if detail >= 2 and not source_code:
+                try:
+                    import inspect
+                    obj = eval(name, {"__builtins__": {}}, self.shell.user_ns)
+                    source_code = inspect.getsource(obj)
+                except Exception:
+                    pass
 
             return InspectResult(
                 found=True,
@@ -1153,7 +1165,7 @@ class IPythonWorker:
                 type=info.get("type_name"),
                 signature=info.get("call_signature") or info.get("init_signature"),
                 docstring=info.get("docstring") if detail >= 1 else None,
-                sourceCode=info.get("source") if detail >= 2 else None,
+                sourceCode=source_code if detail >= 2 else None,
                 file=info.get("file"),
                 line=info.get("line"),
             )
