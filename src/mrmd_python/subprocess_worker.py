@@ -82,6 +82,10 @@ class SubprocessIPythonWorker:
         # For streaming output
         self._output_callback = None
 
+        # Set matplotlib backend to Agg early (before any imports)
+        # This ensures plots work even if matplotlib is installed later via %pip
+        os.environ.setdefault("MPLBACKEND", "Agg")
+
     def _ensure_initialized(self):
         """Lazy initialization of IPython shell."""
         if self._initialized:
@@ -283,6 +287,62 @@ class SubprocessIPythonWorker:
         except ImportError:
             pass
 
+    def _ensure_matplotlib_hook(self):
+        """Re-apply matplotlib hook after user imports it."""
+        if "matplotlib.pyplot" not in sys.modules:
+            return
+
+        plt = sys.modules["matplotlib.pyplot"]
+        if hasattr(plt.show, "_mrmd_hooked"):
+            return
+
+        worker = self
+
+        def _hooked_show(*args, **kwargs):
+            if worker.assets_dir:
+                from io import BytesIO
+
+                assets_path = Path(worker.assets_dir)
+                assets_path.mkdir(parents=True, exist_ok=True)
+
+                for num in plt.get_fignums():
+                    fig = plt.figure(num)
+                    buf = BytesIO()
+                    fig.savefig(
+                        buf,
+                        format="png",
+                        dpi=150,
+                        bbox_inches="tight",
+                        facecolor="white",
+                        edgecolor="none",
+                    )
+                    buf.seek(0)
+                    png_bytes = buf.getvalue()
+
+                    worker._asset_counter += 1
+                    if worker._current_exec_id:
+                        filename = (
+                            f"{worker._current_exec_id}_{worker._asset_counter:04d}.png"
+                        )
+                    else:
+                        filename = f"figure_{worker._asset_counter:04d}.png"
+                    filepath = assets_path / filename
+                    filepath.write_bytes(png_bytes)
+
+                    asset = Asset(
+                        path=str(filepath),
+                        url=f"/mrp/v1/assets/{filename}",
+                        mimeType="image/png",
+                        assetType="image",
+                        size=len(png_bytes),
+                    )
+                    worker._captured_displays.append({"asset": asdict(asset)})
+
+            plt.close("all")
+
+        _hooked_show._mrmd_hooked = True
+        plt.show = _hooked_show
+
     def execute(self, code: str, store_history: bool = True, exec_id: str | None = None) -> ExecuteResult:
         """Execute code and return result."""
         self._ensure_initialized()
@@ -298,7 +358,14 @@ class SubprocessIPythonWorker:
         result = ExecuteResult()
 
         try:
+            # Ensure matplotlib hook is applied BEFORE execution
+            # (handles case where matplotlib was installed via %pip)
+            self._ensure_matplotlib_hook()
+
             exec_result = self.shell.run_cell(code, store_history=store_history, silent=False)
+
+            # Also check after, in case user imported matplotlib during this cell
+            self._ensure_matplotlib_hook()
 
             result.executionCount = self.shell.execution_count
             result.success = exec_result.success
@@ -463,7 +530,14 @@ class SubprocessIPythonWorker:
         result = ExecuteResult()
 
         try:
+            # Ensure matplotlib hook is applied BEFORE execution
+            # (handles case where matplotlib was installed via %pip)
+            self._ensure_matplotlib_hook()
+
             exec_result = self.shell.run_cell(code, store_history=store_history, silent=False)
+
+            # Also check after, in case user imported matplotlib during this cell
+            self._ensure_matplotlib_hook()
 
             result.executionCount = self.shell.execution_count
             result.success = exec_result.success

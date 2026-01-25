@@ -78,6 +78,10 @@ class IPythonWorker:
         self._captured_displays: list[dict] = []
         self._asset_counter = 0
         self._interrupt_requested = False
+
+        # Set matplotlib backend to Agg early (before any imports)
+        # This ensures plots work even if matplotlib is installed later via %pip
+        os.environ.setdefault("MPLBACKEND", "Agg")
         self._current_exec_id: str | None = None
         self._pending_input: dict | None = None  # For stdin_request handling
         self._input_event: threading.Event | None = None
@@ -742,7 +746,13 @@ class IPythonWorker:
         result = ExecuteResult()
 
         try:
+            # Ensure matplotlib hook is applied BEFORE execution
+            # (handles case where matplotlib was installed via %pip)
+            self._ensure_matplotlib_hook()
+
             exec_result = self.shell.run_cell(code, store_history=store_history, silent=False)
+
+            # Also check after, in case user imported matplotlib during this cell
             self._ensure_matplotlib_hook()
 
             result.executionCount = self.shell.execution_count
@@ -988,7 +998,13 @@ class IPythonWorker:
         getpass_module.getpass = hooked_getpass
 
         try:
+            # Ensure matplotlib hook is applied BEFORE execution
+            # (handles case where matplotlib was installed via %pip)
+            self._ensure_matplotlib_hook()
+
             exec_result = self.shell.run_cell(code, store_history=store_history, silent=False)
+
+            # Also check after, in case user imported matplotlib during this cell
             self._ensure_matplotlib_hook()
 
             result.executionCount = self.shell.execution_count
