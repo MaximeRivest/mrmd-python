@@ -67,6 +67,11 @@ Using with uvx (no install needed):
         help="Port to bind to (0 = auto-assign)",
     )
     parser.add_argument(
+        "--host",
+        default="localhost",
+        help="Host to bind to (default: localhost, use 0.0.0.0 for containers)",
+    )
+    parser.add_argument(
         "--venv",
         default=None,
         help="Virtual environment path (auto-detected if not specified)",
@@ -196,7 +201,7 @@ Using with uvx (no install needed):
         print(f"  cwd:  {cwd}")
         print(f"  port: {args.port or 'auto'}")
         print(f"\nPress Ctrl+C to stop\n")
-        run_daemon(args.id, args.port, venv, cwd, args.assets_dir)
+        run_daemon(args.id, args.port, venv, cwd, args.assets_dir, host=args.host)
     else:
         # Spawn daemon (non-blocking)
         print(f"Starting mrmd-python daemon...")

@@ -226,6 +226,7 @@ def run_daemon(
     venv: str,
     cwd: Optional[str] = None,
     assets_dir: Optional[str] = None,
+    host: str = "localhost",
 ):
     """
     Run the daemon runtime server.
@@ -299,7 +300,7 @@ def run_daemon(
     # Run uvicorn (this blocks)
     uvicorn.run(
         app,
-        host="localhost",
+        host=host,
         port=port,
         log_level="info",
         access_log=False,

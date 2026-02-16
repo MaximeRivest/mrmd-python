@@ -42,25 +42,8 @@ class Capabilities:
     version: str = ""
     languages: list[str] = field(default_factory=lambda: ["python", "py", "python3"])
     features: CapabilityFeatures = field(default_factory=CapabilityFeatures)
-    defaultSession: str = "default"
-    maxSessions: int = 10
     environment: Environment = field(default_factory=Environment)
     lspFallback: str | None = None
-
-
-# =============================================================================
-# Sessions
-# =============================================================================
-
-
-@dataclass
-class Session:
-    id: str
-    language: str = "python"
-    created: str = ""
-    lastActivity: str = ""
-    executionCount: int = 0
-    variableCount: int = 0
 
 
 # =============================================================================

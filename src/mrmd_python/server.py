@@ -7,7 +7,7 @@ The server exposes endpoints at /mrp/v1/* for:
 - Code execution (sync and streaming)
 - Completions, hover, and inspect
 - Variable inspection
-- Session management
+- Runtime reset
 - Asset serving (for matplotlib figures, HTML output, etc.)
 
 Usage:
@@ -37,15 +37,12 @@ from starlette.middleware.cors import CORSMiddleware
 from sse_starlette.sse import EventSourceResponse
 
 from .runtime_client import DaemonRuntimeClient
-from .runtime_daemon import list_runtimes, is_runtime_alive, kill_runtime
 from .worker import IPythonWorker
-# All sessions use independent daemon runtimes for:
-# - GPU memory isolation (critical for vLLM)
-# - Process survival (daemon persists if orchestrator dies)
-# - Registry in ~/.mrmd/runtimes/ for discovery
+# Runtime workers can run either:
+# - locally in-process (daemon_mode=True), or
+# - in an external daemon process via DaemonRuntimeClient.
 #
-# Exception: When running IN a daemon (daemon_mode=True), we use the local
-# IPythonWorker to avoid recursive daemon spawning.
+# Runtime model is single-namespace: one server process == one REPL runtime.
 from .types import (
     Capabilities,
     CapabilityFeatures,
@@ -68,17 +65,12 @@ def _get_current_venv() -> str | None:
     return os.environ.get("VIRTUAL_ENV")
 
 
-class SessionManager:
-    """Manages multiple Python sessions.
+class RuntimeManager:
+    """Manages a single Python runtime process.
 
-    Two modes of operation:
-    1. daemon_mode=True: Used when running INSIDE a daemon process.
-       Uses IPythonWorker directly for local execution.
-       This is a single, independent Python runtime.
-
-    2. daemon_mode=False (default): Used by orchestrators.
-       Each session spawns an independent daemon process via DaemonRuntimeClient.
-       Daemons survive if orchestrator dies, variables persist, GPU memory isolated.
+    Runtime model:
+    - one server process = one REPL namespace
+    - no per-request or per-document MRP sessions
     """
 
     def __init__(
@@ -92,75 +84,53 @@ class SessionManager:
         self.assets_dir = assets_dir
         self.default_venv = venv
         self.daemon_mode = daemon_mode
-        self.sessions: dict[str, dict] = {}
-        # In daemon_mode: workers dict holds IPythonWorker instances
-        # In orchestrator mode: workers dict holds DaemonRuntimeClient instances
-        self.workers: dict[str, IPythonWorker | DaemonRuntimeClient] = {}
+        self.runtime: dict | None = None
+        self.worker: IPythonWorker | DaemonRuntimeClient | None = None
         self._pending_inputs: dict[str, asyncio.Future] = {}
         self._lock = threading.Lock()
 
-    def get_or_create_session(
+    def get_or_create_runtime(
         self,
-        session_id: str,
         venv: str | None = None,
         cwd: str | None = None,
     ) -> tuple[IPythonWorker | DaemonRuntimeClient, dict]:
-        """
-        Get or create a session.
-
-        Behavior depends on daemon_mode:
-        - daemon_mode=True: Creates local IPythonWorker (for use inside daemon)
-        - daemon_mode=False: Creates DaemonRuntimeClient (spawns independent daemon)
-
-        Args:
-            session_id: Unique session identifier
-            venv: Path to virtual environment. If not provided, auto-detects.
-            cwd: Working directory override for this session.
-
-        Returns:
-            Tuple of (worker, session_info)
-        """
-        print(f"[MRPServer.get_or_create_session] session_id={session_id}", flush=True)
-        print(f"[MRPServer.get_or_create_session] venv param={venv}", flush=True)
-        print(f"[MRPServer.get_or_create_session] self.default_venv={self.default_venv}", flush=True)
-        print(f"[MRPServer.get_or_create_session] _get_current_venv()={_get_current_venv()}", flush=True)
-        print(f"[MRPServer.get_or_create_session] sys.prefix={sys.prefix}", flush=True)
+        """Get or create the single runtime worker."""
+        print(f"[MRPServer.get_or_create_runtime] venv param={venv}", flush=True)
+        print(f"[MRPServer.get_or_create_runtime] self.default_venv={self.default_venv}", flush=True)
+        print(f"[MRPServer.get_or_create_runtime] _get_current_venv()={_get_current_venv()}", flush=True)
+        print(f"[MRPServer.get_or_create_runtime] sys.prefix={sys.prefix}", flush=True)
 
         effective_venv = venv or self.default_venv or _get_current_venv() or sys.prefix
         effective_cwd = cwd or self.cwd
 
-        print(f"[MRPServer.get_or_create_session] effective_venv={effective_venv}", flush=True)
-        print(f"[MRPServer.get_or_create_session] daemon_mode={self.daemon_mode}", flush=True)
+        print(f"[MRPServer.get_or_create_runtime] effective_venv={effective_venv}", flush=True)
+        print(f"[MRPServer.get_or_create_runtime] daemon_mode={self.daemon_mode}", flush=True)
 
         with self._lock:
-            if session_id not in self.sessions:
-                print(f"[MRPServer.get_or_create_session] Creating NEW session", flush=True)
+            if self.runtime is None or self.worker is None:
+                print("[MRPServer.get_or_create_runtime] Creating runtime", flush=True)
                 if self.daemon_mode:
-                    # DAEMON MODE: Use local IPythonWorker
-                    # This is the actual execution engine inside the daemon
-                    print(f"[MRPServer.get_or_create_session] Creating IPythonWorker with venv={effective_venv}", flush=True)
                     worker = IPythonWorker(
                         cwd=effective_cwd,
                         assets_dir=self.assets_dir,
                         venv=effective_venv,
                     )
-                    self.sessions[session_id] = {
-                        "id": session_id,
+                    runtime = {
+                        "id": "runtime",
                         "language": "python",
                         "created": datetime.now(timezone.utc).isoformat(),
                         "lastActivity": datetime.now(timezone.utc).isoformat(),
                         "executionCount": 0,
                         "variableCount": 0,
-                        "workerType": "local",  # Local IPython worker
+                        "workerType": "local",
                         "environment": {
                             "cwd": effective_cwd,
                             "virtualenv": effective_venv,
                         },
                     }
                 else:
-                    # ORCHESTRATOR MODE: Spawn independent daemon via HTTP client
                     client = DaemonRuntimeClient(
-                        runtime_id=session_id,
+                        runtime_id="runtime",
                         venv=effective_venv,
                         cwd=effective_cwd,
                         assets_dir=self.assets_dir,
@@ -168,14 +138,14 @@ class SessionManager:
                     )
                     daemon_info = client.get_info()
                     worker = client
-                    self.sessions[session_id] = {
-                        "id": session_id,
+                    runtime = {
+                        "id": "runtime",
                         "language": "python",
                         "created": datetime.now(timezone.utc).isoformat(),
                         "lastActivity": datetime.now(timezone.utc).isoformat(),
                         "executionCount": 0,
                         "variableCount": 0,
-                        "workerType": "daemon",  # Independent daemon process
+                        "workerType": "daemon",
                         "daemon": {
                             "pid": daemon_info.get("pid"),
                             "port": daemon_info.get("port"),
@@ -187,51 +157,40 @@ class SessionManager:
                         },
                     }
 
-                self.workers[session_id] = worker
-            else:
-                print(f"[MRPServer.get_or_create_session] Using EXISTING session", flush=True)
-                existing_worker = self.workers.get(session_id)
-                if existing_worker and hasattr(existing_worker, 'venv'):
-                    print(f"[MRPServer.get_or_create_session] Existing worker venv={existing_worker.venv}", flush=True)
+                self.worker = worker
+                self.runtime = runtime
 
-            session = self.sessions[session_id]
-            session["lastActivity"] = datetime.now(timezone.utc).isoformat()
-            return self.workers[session_id], session
+            self.runtime["lastActivity"] = datetime.now(timezone.utc).isoformat()
+            return self.worker, self.runtime
 
-    def get_session(self, session_id: str) -> dict | None:
-        """Get session info."""
-        return self.sessions.get(session_id)
+    def get_runtime(self) -> dict | None:
+        """Get runtime info if initialized."""
+        return self.runtime
 
-    def list_sessions(self) -> list[dict]:
-        """List all sessions."""
-        return list(self.sessions.values())
-
-    def destroy_session(self, session_id: str) -> bool:
-        """
-        Destroy a session and release all resources.
-
-        In daemon mode: Resets the local IPythonWorker
-        In orchestrator mode: Kills the daemon process, releasing GPU/VRAM
-        """
-        with self._lock:
-            if session_id in self.sessions:
-                if session_id in self.workers:
-                    worker = self.workers[session_id]
-                    if hasattr(worker, 'shutdown'):
-                        worker.shutdown()  # DaemonRuntimeClient - kills daemon
-                    elif hasattr(worker, 'reset'):
-                        worker.reset()  # IPythonWorker - just reset
-                    del self.workers[session_id]
-
-                del self.sessions[session_id]
-                return True
+    def reset_runtime(self) -> bool:
+        """Reset runtime state (clear namespace)."""
+        if not self.worker or not self.runtime:
             return False
+        if hasattr(self.worker, 'reset'):
+            self.worker.reset()
+        self.runtime["executionCount"] = 0
+        self.runtime["variableCount"] = 0
+        self.runtime["lastActivity"] = datetime.now(timezone.utc).isoformat()
+        return True
 
-    def get_worker_info(self, session_id: str) -> dict | None:
-        """Get info about the worker for a session."""
-        if session_id not in self.workers:
-            return None
-        return self.workers[session_id].get_info()
+    def shutdown(self) -> bool:
+        """Shutdown runtime worker and clear metadata."""
+        with self._lock:
+            if self.worker is None:
+                return False
+            worker = self.worker
+            if hasattr(worker, 'shutdown'):
+                worker.shutdown()
+            elif hasattr(worker, 'reset'):
+                worker.reset()
+            self.worker = None
+            self.runtime = None
+            return True
 
     def register_pending_input(self, exec_id: str, loop: asyncio.AbstractEventLoop) -> asyncio.Future:
         """Register that an execution is waiting for input."""
@@ -249,15 +208,10 @@ class SessionManager:
         return False
 
     def cancel_pending_input(self, exec_id: str) -> bool:
-        """Cancel a pending input request.
-
-        This is called when the user dismisses the input field (e.g., cancels
-        execution, navigates away) to unblock the waiting worker thread.
-        """
+        """Cancel a pending input request."""
         if exec_id in self._pending_inputs:
             future = self._pending_inputs.pop(exec_id)
             if not future.done():
-                # Set exception to unblock the waiting worker
                 future.get_loop().call_soon_threadsafe(
                     future.set_exception,
                     InputCancelledError("Input cancelled by user")
@@ -280,7 +234,7 @@ class MRPServer:
         self.assets_dir = assets_dir or os.path.join(self.cwd, ".mrmd-assets")
         self.venv = venv
         self.daemon_mode = daemon_mode
-        self.session_manager = SessionManager(
+        self.runtime_manager = RuntimeManager(
             cwd=self.cwd,
             assets_dir=self.assets_dir,
             venv=venv,
@@ -307,8 +261,6 @@ class MRPServer:
                 format=True,
                 assets=True,
             ),
-            defaultSession="default",
-            maxSessions=10,
             environment=Environment(
                 cwd=self.cwd,
                 executable=sys.executable,
@@ -325,74 +277,22 @@ class MRPServer:
         caps = self.get_capabilities()
         return JSONResponse(_dataclass_to_dict(caps))
 
-    async def handle_list_sessions(self, request: Request) -> JSONResponse:
-        """GET /sessions"""
-        sessions = self.session_manager.list_sessions()
-        return JSONResponse({"sessions": sessions})
-
-    async def handle_create_session(self, request: Request) -> JSONResponse:
-        """POST /sessions
-
-        Create a new session with optional environment configuration.
-
-        Request body:
-            id: Optional session ID (generated if not provided)
-            language: Language (default: python)
-            environment:
-                cwd: Working directory
-                virtualenv: Path to venv (enables subprocess isolation)
-                executable: Python executable (ignored, derived from venv)
-                env: Environment variables (not yet implemented)
-            dependencies: Package dependencies (not yet implemented)
-        """
-        body = await request.json()
-        session_id = body.get("id", str(uuid.uuid4())[:8])
-
-        # Extract environment config
-        env_config = body.get("environment", {})
-        venv = env_config.get("virtualenv")
-        cwd = env_config.get("cwd")
-
-        worker, session = self.session_manager.get_or_create_session(
-            session_id,
-            venv=venv,
-            cwd=cwd,
-        )
-        return JSONResponse(session)
-
-    async def handle_get_session(self, request: Request) -> JSONResponse:
-        """GET /sessions/{id}"""
-        session_id = request.path_params["id"]
-        session = self.session_manager.get_session(session_id)
-        if not session:
-            return JSONResponse({"error": "Session not found"}, status_code=404)
-        return JSONResponse(session)
-
-    async def handle_delete_session(self, request: Request) -> JSONResponse:
-        """DELETE /sessions/{id}"""
-        session_id = request.path_params["id"]
-        if self.session_manager.destroy_session(session_id):
-            return JSONResponse({"success": True})
-        return JSONResponse({"error": "Session not found"}, status_code=404)
-
-    async def handle_reset_session(self, request: Request) -> JSONResponse:
-        """POST /sessions/{id}/reset"""
-        session_id = request.path_params["id"]
-        worker, session = self.session_manager.get_or_create_session(session_id)
+    async def handle_reset_runtime(self, request: Request) -> JSONResponse:
+        """POST /reset"""
+        worker, runtime = self.runtime_manager.get_or_create_runtime()
         worker.reset()
-        session["executionCount"] = 0
-        session["variableCount"] = 0
+        runtime["executionCount"] = 0
+        runtime["variableCount"] = 0
         return JSONResponse({"success": True})
 
     async def handle_execute(self, request: Request) -> JSONResponse:
         """POST /execute"""
         body = await request.json()
         code = body.get("code", "")
-        session_id = body.get("session", "default")
         store_history = body.get("storeHistory", True)
         exec_id = body.get("execId", str(uuid.uuid4())[:8])
 
-        worker, session = self.session_manager.get_or_create_session(session_id)
+        worker, runtime = self.runtime_manager.get_or_create_runtime()
 
         # Run in thread pool to not block
         loop = asyncio.get_event_loop()
@@ -400,8 +300,8 @@ class MRPServer:
             None, lambda: worker.execute(code, store_history, exec_id)
         )
 
-        session["executionCount"] = result.executionCount
-        session["variableCount"] = len(worker.get_variables().variables)
+        runtime["executionCount"] = result.executionCount
+        runtime["variableCount"] = len(worker.get_variables().variables)
 
         return JSONResponse(_dataclass_to_dict(result))
 
@@ -410,12 +310,11 @@ class MRPServer:
         print(f"[DEBUG] handle_execute_stream called", flush=True)
         body = await request.json()
         code = body.get("code", "")
-        session_id = body.get("session", "default")
         store_history = body.get("storeHistory", True)
         exec_id = body.get("execId", str(uuid.uuid4())[:8])
-        print(f"[DEBUG] session_id={session_id}, code length={len(code)}, exec_id={exec_id}", flush=True)
+        print(f"[DEBUG] code length={len(code)}, exec_id={exec_id}", flush=True)
 
-        worker, session = self.session_manager.get_or_create_session(session_id)
+        worker, runtime = self.runtime_manager.get_or_create_runtime()
         print(f"[DEBUG] Got worker, starting event generator", flush=True)
 
         async def event_generator():
@@ -468,7 +367,7 @@ class MRPServer:
                 )
 
                 # Register that we're waiting for input and get a future
-                future = self.session_manager.register_pending_input(exec_id, loop)
+                future = self.runtime_manager.register_pending_input(exec_id, loop)
 
                 # Wait for the input (blocking - we're in a worker thread)
                 # Use run_coroutine_threadsafe to wait on the future from this thread
@@ -529,8 +428,8 @@ class MRPServer:
 
             result = result_holder[0]
             if result:
-                session["executionCount"] = result.executionCount
-                session["variableCount"] = len(worker.get_variables().variables)
+                runtime["executionCount"] = result.executionCount
+                runtime["variableCount"] = len(worker.get_variables().variables)
 
                 if result.success:
                     yield {
@@ -553,7 +452,7 @@ class MRPServer:
         exec_id = body.get("exec_id", "")
         text = body.get("text", "")
 
-        if self.session_manager.provide_input(exec_id, text):
+        if self.runtime_manager.provide_input(exec_id, text):
             return JSONResponse({"accepted": True})
         return JSONResponse({"accepted": False, "error": "No pending input request"})
 
@@ -566,27 +465,17 @@ class MRPServer:
         body = await request.json()
         exec_id = body.get("exec_id", "")
 
-        if self.session_manager.cancel_pending_input(exec_id):
+        if self.runtime_manager.cancel_pending_input(exec_id):
             return JSONResponse({"cancelled": True})
         return JSONResponse({"cancelled": False, "error": "No pending input request"})
 
     async def handle_interrupt(self, request: Request) -> JSONResponse:
         """POST /interrupt
 
-        Interrupt currently running code in a session.
+        Interrupt currently running code in the runtime.
         Sends SIGINT to subprocess workers or sets interrupt flag for local workers.
         """
-        body = await request.json()
-        session_id = body.get("session", "default")
-
-        # Get the worker for this session (don't create if doesn't exist)
-        session = self.session_manager.get_session(session_id)
-        if not session:
-            return JSONResponse({"interrupted": False, "error": "Session not found"})
-
-        worker = self.session_manager.workers.get(session_id)
-        if not worker:
-            return JSONResponse({"interrupted": False, "error": "Worker not found"})
+        worker, _ = self.runtime_manager.get_or_create_runtime()
 
         # Call interrupt on the worker
         try:
@@ -600,9 +489,8 @@ class MRPServer:
         body = await request.json()
         code = body.get("code", "")
         cursor = body.get("cursor", len(code))
-        session_id = body.get("session", "default")
 
-        worker, _ = self.session_manager.get_or_create_session(session_id)
+        worker, _ = self.runtime_manager.get_or_create_runtime()
 
         loop = asyncio.get_event_loop()
         result = await loop.run_in_executor(
@@ -616,10 +504,9 @@ class MRPServer:
         body = await request.json()
         code = body.get("code", "")
         cursor = body.get("cursor", len(code))
-        session_id = body.get("session", "default")
         detail = body.get("detail", 1)
 
-        worker, _ = self.session_manager.get_or_create_session(session_id)
+        worker, _ = self.runtime_manager.get_or_create_runtime()
 
         loop = asyncio.get_event_loop()
         result = await loop.run_in_executor(
@@ -633,9 +520,8 @@ class MRPServer:
         body = await request.json()
         code = body.get("code", "")
         cursor = body.get("cursor", len(code))
-        session_id = body.get("session", "default")
 
-        worker, _ = self.session_manager.get_or_create_session(session_id)
+        worker, _ = self.runtime_manager.get_or_create_runtime()
 
         loop = asyncio.get_event_loop()
         result = await loop.run_in_executor(
@@ -647,9 +533,8 @@ class MRPServer:
     async def handle_variables(self, request: Request) -> JSONResponse:
         """POST /variables"""
         body = await request.json()
-        session_id = body.get("session", "default")
 
-        worker, _ = self.session_manager.get_or_create_session(session_id)
+        worker, _ = self.runtime_manager.get_or_create_runtime()
 
         loop = asyncio.get_event_loop()
         result = await loop.run_in_executor(None, worker.get_variables)
@@ -660,10 +545,9 @@ class MRPServer:
         """POST /variables/{name}"""
         name = request.path_params["name"]
         body = await request.json()
-        session_id = body.get("session", "default")
         path = body.get("path")
 
-        worker, _ = self.session_manager.get_or_create_session(session_id)
+        worker, _ = self.runtime_manager.get_or_create_runtime()
 
         loop = asyncio.get_event_loop()
         result = await loop.run_in_executor(
@@ -676,9 +560,8 @@ class MRPServer:
         """POST /is_complete"""
         body = await request.json()
         code = body.get("code", "")
-        session_id = body.get("session", "default")
 
-        worker, _ = self.session_manager.get_or_create_session(session_id)
+        worker, _ = self.runtime_manager.get_or_create_runtime()
 
         loop = asyncio.get_event_loop()
         result = await loop.run_in_executor(
@@ -691,9 +574,8 @@ class MRPServer:
         """POST /format"""
         body = await request.json()
         code = body.get("code", "")
-        session_id = body.get("session", "default")
 
-        worker, _ = self.session_manager.get_or_create_session(session_id)
+        worker, _ = self.runtime_manager.get_or_create_runtime()
 
         loop = asyncio.get_event_loop()
         formatted, changed = await loop.run_in_executor(
@@ -728,11 +610,7 @@ class MRPServer:
         """Create all routes."""
         return [
             Route("/mrp/v1/capabilities", self.handle_capabilities, methods=["GET"]),
-            Route("/mrp/v1/sessions", self.handle_list_sessions, methods=["GET"]),
-            Route("/mrp/v1/sessions", self.handle_create_session, methods=["POST"]),
-            Route("/mrp/v1/sessions/{id}", self.handle_get_session, methods=["GET"]),
-            Route("/mrp/v1/sessions/{id}", self.handle_delete_session, methods=["DELETE"]),
-            Route("/mrp/v1/sessions/{id}/reset", self.handle_reset_session, methods=["POST"]),
+            Route("/mrp/v1/reset", self.handle_reset_runtime, methods=["POST"]),
             Route("/mrp/v1/execute", self.handle_execute, methods=["POST"]),
             Route("/mrp/v1/execute/stream", self.handle_execute_stream, methods=["POST"]),
             Route("/mrp/v1/input", self.handle_input, methods=["POST"]),
@@ -778,7 +656,7 @@ def create_app(
         assets_dir: Directory for saving assets (plots, etc.)
         venv: Path to virtual environment to use for code execution.
         daemon_mode: If True, use local IPythonWorker (for daemon process).
-                    If False, spawn independent daemon processes for each session.
+                    If False, use an external daemon-backed runtime worker.
     """
     server = MRPServer(cwd=cwd, assets_dir=assets_dir, venv=venv, daemon_mode=daemon_mode)
 

@@ -144,7 +144,6 @@ class DaemonRuntimeClient:
         data = {
             "code": code,
             "storeHistory": store_history,
-            "session": "default",  # Daemon uses default session
         }
         if exec_id:
             data["execId"] = exec_id
@@ -170,7 +169,6 @@ class DaemonRuntimeClient:
         data = {
             "code": code,
             "storeHistory": store_history,
-            "session": "default",
         }
         if exec_id:
             data["execId"] = exec_id
@@ -225,7 +223,6 @@ class DaemonRuntimeClient:
         result = self._post("/complete", {
             "code": code,
             "cursor": cursor_pos,
-            "session": "default",
         })
 
         matches = []
@@ -252,7 +249,6 @@ class DaemonRuntimeClient:
             "code": code,
             "cursor": cursor_pos,
             "detail": detail,
-            "session": "default",
         })
 
         return InspectResult(
@@ -273,7 +269,6 @@ class DaemonRuntimeClient:
         result = self._post("/hover", {
             "code": code,
             "cursor": cursor_pos,
-            "session": "default",
         })
 
         return HoverResult(
@@ -286,7 +281,7 @@ class DaemonRuntimeClient:
 
     def get_variables(self) -> VariablesResult:
         """Get user variables."""
-        result = self._post("/variables", {"session": "default"})
+        result = self._post("/variables", {})
 
         variables = []
         for v in result.get("variables", []):
@@ -310,7 +305,6 @@ class DaemonRuntimeClient:
     def get_variable_detail(self, name: str, path: Optional[list[str]] = None) -> VariableDetail:
         """Get detailed info about a variable."""
         result = self._post(f"/variables/{name}", {
-            "session": "default",
             "path": path,
         })
 
@@ -343,7 +337,6 @@ class DaemonRuntimeClient:
         """Check if code is a complete statement."""
         result = self._post("/is_complete", {
             "code": code,
-            "session": "default",
         })
 
         return IsCompleteResult(
@@ -355,7 +348,6 @@ class DaemonRuntimeClient:
         """Format code using black."""
         result = self._post("/format", {
             "code": code,
-            "session": "default",
         })
 
         return result.get("formatted", code), result.get("changed", False)
@@ -363,8 +355,7 @@ class DaemonRuntimeClient:
     def reset(self):
         """Reset the runtime namespace."""
         self._ensure_connected()
-        # Use the session reset endpoint
-        self._client.post("/sessions/default/reset")
+        self._client.post("/reset")
 
     def get_info(self) -> dict:
         """Get info about the daemon runtime."""
@@ -408,7 +399,7 @@ class DaemonRuntimeClient:
         Returns True if request was sent successfully.
         """
         try:
-            result = self._post("/mrp/v1/interrupt", {"session": "default"})
+            result = self._post("/interrupt", {})
             return result.get("interrupted", False)
         except Exception:
             return False
