@@ -227,11 +227,18 @@ def run_daemon(
     cwd: Optional[str] = None,
     assets_dir: Optional[str] = None,
     host: str = "localhost",
+    managed: bool = False,
 ):
     """
     Run the daemon runtime server.
 
-    This is called after daemonize() in the grandchild process.
+    This is called after daemonize() in the grandchild process,
+    or directly in foreground mode.
+
+    Args:
+        managed: If True, skip writing to ~/.mrmd/runtimes/ and skip
+                 atexit/signal cleanup. Used when an external process manager
+                 (like mrmd-electron's RuntimeService) owns the lifecycle.
     """
     # Redirect output to log file
     ensure_dirs()
@@ -248,31 +255,33 @@ def run_daemon(
     if port == 0:
         port = get_free_port()
 
-    # Write runtime info
-    info = {
-        "id": runtime_id,
-        "pid": os.getpid(),
-        "port": port,
-        "host": "localhost",
-        "url": f"http://localhost:{port}/mrp/v1",
-        "venv": venv,
-        "cwd": cwd or os.getcwd(),
-        "assets_dir": assets_dir,
-        "created": datetime.now(timezone.utc).isoformat(),
-        "lastActivity": datetime.now(timezone.utc).isoformat(),
-    }
-    write_runtime_info(info)
+    if not managed:
+        # Write runtime info to ~/.mrmd/runtimes/ for discovery by other processes.
+        # Skip this in managed mode — the external process manager handles registration.
+        info = {
+            "id": runtime_id,
+            "pid": os.getpid(),
+            "port": port,
+            "host": "localhost",
+            "url": f"http://localhost:{port}/mrp/v1",
+            "venv": venv,
+            "cwd": cwd or os.getcwd(),
+            "assets_dir": assets_dir,
+            "created": datetime.now(timezone.utc).isoformat(),
+            "lastActivity": datetime.now(timezone.utc).isoformat(),
+        }
+        write_runtime_info(info)
 
-    # Register cleanup on exit
-    def cleanup():
-        remove_runtime_info(runtime_id)
-    atexit.register(cleanup)
+        # Register cleanup on exit
+        def cleanup():
+            remove_runtime_info(runtime_id)
+        atexit.register(cleanup)
 
-    # Handle SIGTERM gracefully
-    def handle_sigterm(signum, frame):
-        cleanup()
-        sys.exit(0)
-    signal.signal(signal.SIGTERM, handle_sigterm)
+        # Handle SIGTERM gracefully
+        def handle_sigterm(signum, frame):
+            cleanup()
+            sys.exit(0)
+        signal.signal(signal.SIGTERM, handle_sigterm)
 
     print(f"[{datetime.now().isoformat()}] Starting runtime daemon {runtime_id} on port {port}")
     print(f"  PID: {os.getpid()}")
@@ -297,14 +306,51 @@ def run_daemon(
     print(f"  App created successfully")
     sys.stdout.flush()
 
-    # Run uvicorn (this blocks)
-    uvicorn.run(
+    # Run uvicorn using Config/Server so we can trace signal-initiated shutdowns
+    uvi_config = uvicorn.Config(
         app,
         host=host,
         port=port,
         log_level="info",
         access_log=False,
     )
+    server = uvicorn.Server(uvi_config)
+
+    # Wrap uvicorn's signal handler to log what causes shutdown
+    _original_handle_exit = server.handle_exit
+
+    def traced_handle_exit(sig, frame):
+        sig_name = signal.Signals(sig).name if hasattr(signal, 'Signals') else str(sig)
+
+        # In managed mode, the parent RuntimeService owns lifecycle.
+        # Ignore external INT/TERM bursts; RuntimeService uses SIGKILL for
+        # explicit stop/restart in managed Python mode.
+        if managed and sig in (signal.SIGTERM, signal.SIGINT):
+            print(f"[{datetime.now().isoformat()}] Ignoring external signal in managed mode: {sig_name}", flush=True)
+            return
+
+        print(f"[{datetime.now().isoformat()}] Shutdown signal received: {sig_name}", flush=True)
+        _original_handle_exit(sig, frame)
+
+    server.handle_exit = traced_handle_exit
+
+    # Run the server (this blocks)
+    import asyncio
+    try:
+        result = asyncio.run(server.serve())
+        print(
+            f"[{datetime.now().isoformat()}] Server loop exited "
+            f"(result={result}, should_exit={getattr(server, 'should_exit', None)}, "
+            f"force_exit={getattr(server, 'force_exit', None)}, "
+            f"captured_signals={getattr(server, '_captured_signals', None)})",
+            flush=True,
+        )
+    except KeyboardInterrupt:
+        # Can happen when uvicorn re-raises captured signals at loop teardown.
+        print(f"[{datetime.now().isoformat()}] Server loop interrupted by KeyboardInterrupt", flush=True)
+    except Exception as e:
+        print(f"[{datetime.now().isoformat()}] Server loop crashed: {type(e).__name__}: {e}", flush=True)
+        raise
 
 
 def spawn_daemon(

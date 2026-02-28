@@ -93,6 +93,12 @@ Using with uvx (no install needed):
         action="store_true",
         help="Run in foreground instead of daemon mode",
     )
+    parser.add_argument(
+        "--managed",
+        action="store_true",
+        help="Managed mode: skip writing to ~/.mrmd/runtimes/ registry "
+             "(used when an external process manager owns the lifecycle)",
+    )
 
     # Management commands
     parser.add_argument(
@@ -183,25 +189,27 @@ Using with uvx (no install needed):
     # Determine cwd
     cwd = args.cwd or os.getcwd()
 
-    # Check if runtime already exists
-    existing = read_runtime_info(args.id)
-    if existing and is_runtime_alive(args.id):
-        print(f"Runtime '{args.id}' is already running:")
-        print(f"  URL:  {existing.get('url')}")
-        print(f"  PID:  {existing.get('pid')}")
-        print(f"  venv: {existing.get('venv')}")
-        print(f"\nTo kill it: mrmd-python --kill {args.id}")
-        return
+    # Check if runtime already exists (skip in managed mode — parent handles this)
+    if not args.managed:
+        existing = read_runtime_info(args.id)
+        if existing and is_runtime_alive(args.id):
+            print(f"Runtime '{args.id}' is already running:")
+            print(f"  URL:  {existing.get('url')}")
+            print(f"  PID:  {existing.get('pid')}")
+            print(f"  venv: {existing.get('venv')}")
+            print(f"\nTo kill it: mrmd-python --kill {args.id}")
+            return
 
     if args.foreground:
-        # Run in foreground (blocking, for debugging)
-        print(f"Starting mrmd-python in foreground mode...")
-        print(f"  ID:   {args.id}")
-        print(f"  venv: {venv}")
-        print(f"  cwd:  {cwd}")
-        print(f"  port: {args.port or 'auto'}")
-        print(f"\nPress Ctrl+C to stop\n")
-        run_daemon(args.id, args.port, venv, cwd, args.assets_dir, host=args.host)
+        # Run in foreground (blocking, for debugging or managed mode)
+        if not args.managed:
+            print(f"Starting mrmd-python in foreground mode...")
+            print(f"  ID:   {args.id}")
+            print(f"  venv: {venv}")
+            print(f"  cwd:  {cwd}")
+            print(f"  port: {args.port or 'auto'}")
+            print(f"\nPress Ctrl+C to stop\n")
+        run_daemon(args.id, args.port, venv, cwd, args.assets_dir, host=args.host, managed=args.managed)
     else:
         # Spawn daemon (non-blocking)
         print(f"Starting mrmd-python daemon...")

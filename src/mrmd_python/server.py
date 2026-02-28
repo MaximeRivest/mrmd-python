@@ -95,20 +95,11 @@ class RuntimeManager:
         cwd: str | None = None,
     ) -> tuple[IPythonWorker | DaemonRuntimeClient, dict]:
         """Get or create the single runtime worker."""
-        print(f"[MRPServer.get_or_create_runtime] venv param={venv}", flush=True)
-        print(f"[MRPServer.get_or_create_runtime] self.default_venv={self.default_venv}", flush=True)
-        print(f"[MRPServer.get_or_create_runtime] _get_current_venv()={_get_current_venv()}", flush=True)
-        print(f"[MRPServer.get_or_create_runtime] sys.prefix={sys.prefix}", flush=True)
-
         effective_venv = venv or self.default_venv or _get_current_venv() or sys.prefix
         effective_cwd = cwd or self.cwd
 
-        print(f"[MRPServer.get_or_create_runtime] effective_venv={effective_venv}", flush=True)
-        print(f"[MRPServer.get_or_create_runtime] daemon_mode={self.daemon_mode}", flush=True)
-
         with self._lock:
             if self.runtime is None or self.worker is None:
-                print("[MRPServer.get_or_create_runtime] Creating runtime", flush=True)
                 if self.daemon_mode:
                     worker = IPythonWorker(
                         cwd=effective_cwd,
@@ -307,15 +298,12 @@ class MRPServer:
 
     async def handle_execute_stream(self, request: Request) -> EventSourceResponse:
         """POST /execute/stream - SSE streaming execution"""
-        print(f"[DEBUG] handle_execute_stream called", flush=True)
         body = await request.json()
         code = body.get("code", "")
         store_history = body.get("storeHistory", True)
         exec_id = body.get("execId", str(uuid.uuid4())[:8])
-        print(f"[DEBUG] code length={len(code)}, exec_id={exec_id}", flush=True)
 
         worker, runtime = self.runtime_manager.get_or_create_runtime()
-        print(f"[DEBUG] Got worker, starting event generator", flush=True)
 
         async def event_generator():
             # Capture the event loop for use in background threads
