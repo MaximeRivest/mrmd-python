@@ -277,6 +277,7 @@ class DaemonRuntimeClient:
             type=result.get("type"),
             value=result.get("value"),
             signature=result.get("signature"),
+            docstring=result.get("docstring"),
         )
 
     def get_variables(self) -> VariablesResult:

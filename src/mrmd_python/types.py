@@ -154,6 +154,7 @@ class HoverResult:
     type: str | None = None
     value: str | None = None
     signature: str | None = None
+    docstring: str | None = None
 
 
 # =============================================================================

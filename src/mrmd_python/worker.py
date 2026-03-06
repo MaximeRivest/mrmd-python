@@ -1215,12 +1215,20 @@ class IPythonWorker:
                     except Exception:
                         pass
 
+                docstring = None
+                try:
+                    import inspect
+                    docstring = inspect.getdoc(value)
+                except Exception:
+                    docstring = None
+
                 return HoverResult(
                     found=True,
                     name=name,
                     type=type_name,
                     value=value_str,
                     signature=signature,
+                    docstring=docstring,
                 )
             except Exception:
                 pass
@@ -1233,6 +1241,7 @@ class IPythonWorker:
                     name=name,
                     type=info.get("type_name"),
                     signature=info.get("call_signature"),
+                    docstring=info.get("docstring"),
                 )
 
             return HoverResult(found=False)

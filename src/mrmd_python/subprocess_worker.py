@@ -674,11 +674,19 @@ class SubprocessIPythonWorker:
                 if len(preview) > 200:
                     preview = preview[:197] + "..."
 
+                docstring = None
+                try:
+                    import inspect
+                    docstring = inspect.getdoc(value)
+                except Exception:
+                    docstring = None
+
                 return {
                     "found": True,
                     "name": name,
                     "type": type_name,
                     "value": preview,
+                    "docstring": docstring,
                 }
             except Exception:
                 pass
@@ -690,6 +698,7 @@ class SubprocessIPythonWorker:
                     "name": name,
                     "type": info.get("type_name"),
                     "signature": info.get("call_signature"),
+                    "docstring": info.get("docstring"),
                 }
 
             return {"found": False}
