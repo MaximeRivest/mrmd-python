@@ -43,6 +43,12 @@ RUNTIMES_DIR = MRMD_DIR / "runtimes"
 LOGS_DIR = MRMD_DIR / "logs"
 
 
+def _sanitize_filename(runtime_id: str) -> str:
+    """Sanitize runtime ID for use in filenames (Windows forbids : < > | etc.)."""
+    # Replace characters illegal in Windows filenames
+    return runtime_id.replace(':', '_').replace('<', '_').replace('>', '_').replace('|', '_')
+
+
 def get_free_port() -> int:
     """Find an available port."""
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
@@ -58,12 +64,12 @@ def ensure_dirs():
 
 def get_runtime_info_path(runtime_id: str) -> Path:
     """Get path to runtime info file."""
-    return RUNTIMES_DIR / f"{runtime_id}.json"
+    return RUNTIMES_DIR / f"{_sanitize_filename(runtime_id)}.json"
 
 
 def get_runtime_log_path(runtime_id: str) -> Path:
     """Get path to runtime log file."""
-    return LOGS_DIR / f"{runtime_id}.log"
+    return LOGS_DIR / f"{_sanitize_filename(runtime_id)}.log"
 
 
 def read_runtime_info(runtime_id: str) -> Optional[dict]:
@@ -113,7 +119,12 @@ def list_runtimes() -> list[dict]:
 
 
 def is_runtime_alive(runtime_id: str) -> bool:
-    """Check if a runtime is still running."""
+    """Check if a runtime is still running.
+
+    On Windows, ``os.kill(pid, 0)`` can sometimes surface as ``SystemError``
+    for stale/reused PIDs instead of a plain ``OSError``. Treat any exception
+    here as "not alive" so stale registry files never block restart.
+    """
     info = read_runtime_info(runtime_id)
     if not info:
         return False
@@ -123,7 +134,7 @@ def is_runtime_alive(runtime_id: str) -> bool:
     try:
         os.kill(pid, 0)
         return True
-    except OSError:
+    except Exception:
         return False
 
 
