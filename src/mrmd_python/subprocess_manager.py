@@ -32,6 +32,8 @@ from .types import (
     Variable,
     VariableDetail,
     IsCompleteResult,
+    HistoryEntry,
+    HistoryResult,
 )
 
 
@@ -363,6 +365,33 @@ class SubprocessWorker:
         """Format code using black (not implemented in subprocess yet)."""
         # Could implement this in subprocess_worker if needed
         return code, False
+
+    def get_history(
+        self,
+        n: int = 20,
+        pattern: str | None = None,
+        before: int | None = None,
+    ) -> HistoryResult:
+        """Get persistent IPython history from the subprocess."""
+        response = self._send_command({
+            "type": "history",
+            "n": n,
+            "pattern": pattern,
+            "before": before,
+        })
+
+        if response.get("type") == "error":
+            return HistoryResult(entries=[], hasMore=False)
+
+        result = response.get("result", {})
+        entries = [
+            HistoryEntry(
+                historyIndex=entry.get("historyIndex", 0),
+                code=entry.get("code", ""),
+            )
+            for entry in result.get("entries", [])
+        ]
+        return HistoryResult(entries=entries, hasMore=result.get("hasMore", False))
 
     def reset(self):
         """Reset the namespace."""

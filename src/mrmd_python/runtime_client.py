@@ -31,6 +31,8 @@ from .types import (
     Variable,
     VariableDetail,
     IsCompleteResult,
+    HistoryEntry,
+    HistoryResult,
 )
 from .runtime_daemon import (
     spawn_daemon,
@@ -352,6 +354,29 @@ class DaemonRuntimeClient:
         })
 
         return result.get("formatted", code), result.get("changed", False)
+
+    def get_history(
+        self,
+        n: int = 20,
+        pattern: Optional[str] = None,
+        before: Optional[int] = None,
+    ) -> HistoryResult:
+        """Get persistent runtime history."""
+        payload = {"n": n}
+        if pattern is not None:
+            payload["pattern"] = pattern
+        if before is not None:
+            payload["before"] = before
+
+        result = self._post("/history", payload)
+        entries = [
+            HistoryEntry(
+                historyIndex=entry.get("historyIndex", 0),
+                code=entry.get("code", ""),
+            )
+            for entry in result.get("entries", [])
+        ]
+        return HistoryResult(entries=entries, hasMore=result.get("hasMore", False))
 
     def reset(self):
         """Reset the runtime namespace."""

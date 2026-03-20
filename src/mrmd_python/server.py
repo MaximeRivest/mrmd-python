@@ -250,6 +250,7 @@ class MRPServer:
                 reset=True,
                 isComplete=True,
                 format=True,
+                history=True,
                 assets=True,
             ),
             environment=Environment(
@@ -572,6 +573,22 @@ class MRPServer:
 
         return JSONResponse({"formatted": formatted, "changed": changed})
 
+    async def handle_history(self, request: Request) -> JSONResponse:
+        """POST /history"""
+        body = await request.json() if request.method == "POST" else {}
+        n = body.get("n", 20)
+        pattern = body.get("pattern")
+        before = body.get("before")
+
+        worker, _ = self.runtime_manager.get_or_create_runtime()
+
+        loop = asyncio.get_event_loop()
+        result = await loop.run_in_executor(
+            None, lambda: worker.get_history(n=n, pattern=pattern, before=before)
+        )
+
+        return JSONResponse(_dataclass_to_dict(result))
+
     async def handle_asset(self, request: Request) -> Response:
         """GET /assets/{path}"""
         asset_path = request.path_params["path"]
@@ -611,6 +628,7 @@ class MRPServer:
             Route("/mrp/v1/variables/{name}", self.handle_variable_detail, methods=["POST"]),
             Route("/mrp/v1/is_complete", self.handle_is_complete, methods=["POST"]),
             Route("/mrp/v1/format", self.handle_format, methods=["POST"]),
+            Route("/mrp/v1/history", self.handle_history, methods=["POST"]),
             Route("/mrp/v1/assets/{path:path}", self.handle_asset, methods=["GET"]),
         ]
 

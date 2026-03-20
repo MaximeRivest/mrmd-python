@@ -8,7 +8,7 @@ Independent Python runtime for MRMD notebooks. Runs as a daemon process with ful
 - **GPU memory isolation** - kill daemon to release VRAM (critical for vLLM)
 - **Auto venv detection** - uses current venv or `VIRTUAL_ENV`
 - **Registry-based discovery** - find runtimes via `~/.mrmd/runtimes/`
-- **Full MRP protocol** - execute, completions, inspect, variables, streaming
+- **Full MRP protocol** - execute, completions, inspect, variables, streaming, history
 
 ## Installation
 
@@ -81,6 +81,7 @@ All endpoints at `/mrp/v1/`:
 | `/variables/{name}` | POST | Get variable details |
 | `/is_complete` | POST | Check if code is complete |
 | `/format` | POST | Format code with black |
+| `/history` | POST | Browse persistent IPython history |
 
 ## Architecture
 
@@ -97,6 +98,8 @@ Each runtime is a fully independent process:
 - Own IPython shell with persistent variables
 - HTTP server on auto-assigned port
 - Registered in `~/.mrmd/runtimes/` for discovery
+
+History is backed by IPython's native persistent history database, so `/history` survives runtime restarts and `POST /reset`.
 
 ## GPU Memory Management
 

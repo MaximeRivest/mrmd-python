@@ -26,6 +26,7 @@ class CapabilityFeatures:
     reset: bool = True
     isComplete: bool = True
     format: bool = False
+    history: bool = True
     assets: bool = True
 
 
@@ -205,6 +206,18 @@ class IsCompleteResult:
 class FormatResult:
     formatted: str = ""
     changed: bool = False
+
+
+@dataclass
+class HistoryEntry:
+    historyIndex: int
+    code: str
+
+
+@dataclass
+class HistoryResult:
+    entries: list[HistoryEntry] = field(default_factory=list)
+    hasMore: bool = False
 
 
 # =============================================================================

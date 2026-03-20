@@ -39,6 +39,8 @@ from .types import (
     VariablesResult,
     VariableDetail,
     IsCompleteResult,
+    HistoryEntry,
+    HistoryResult,
     StdinRequest,
     InputCancelledError,
 )
@@ -1457,6 +1459,47 @@ class IPythonWorker:
             return code, False
         except Exception:
             return code, False
+
+    def get_history(
+        self,
+        n: int = 20,
+        pattern: str | None = None,
+        before: int | None = None,
+    ) -> HistoryResult:
+        """Get persistent IPython history."""
+        if self._should_use_subprocess():
+            return self._get_subprocess_worker().get_history(n=n, pattern=pattern, before=before)
+
+        self._ensure_initialized()
+
+        try:
+            if n <= 0:
+                n = 20
+
+            history_manager = self.shell.history_manager
+            search_pattern = pattern or "*"
+            rows = list(history_manager.search(search_pattern, raw=True, output=False, unique=False))
+
+            entries: list[HistoryEntry] = []
+            for row in rows:
+                if len(row) < 3:
+                    continue
+                session_id = int(row[0])
+                line_number = int(row[1])
+                code = row[2] or ""
+                history_index = self._make_history_index(session_id, line_number)
+                if before is not None and history_index >= before:
+                    continue
+                entries.append(HistoryEntry(historyIndex=history_index, code=code))
+
+            start = max(0, len(entries) - n)
+            return HistoryResult(entries=entries[start:], hasMore=start > 0)
+        except Exception:
+            return HistoryResult(entries=[], hasMore=False)
+
+    def _make_history_index(self, session_id: int, line_number: int) -> int:
+        """Encode IPython's (session, line) history key as a stable integer."""
+        return (int(session_id) << 32) | int(line_number)
 
     # =========================================================================
     # Session Management

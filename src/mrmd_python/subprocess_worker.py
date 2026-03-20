@@ -766,6 +766,41 @@ class SubprocessIPythonWorker:
         except Exception:
             return {"status": "unknown", "indent": ""}
 
+    def get_history(self, n: int = 20, pattern: str | None = None, before: int | None = None) -> dict:
+        """Get persistent IPython history."""
+        self._ensure_initialized()
+
+        try:
+            if n <= 0:
+                n = 20
+
+            history_manager = self.shell.history_manager
+            search_pattern = pattern or "*"
+            rows = list(history_manager.search(search_pattern, raw=True, output=False, unique=False))
+
+            entries = []
+            for row in rows:
+                if len(row) < 3:
+                    continue
+                session_id = int(row[0])
+                line_number = int(row[1])
+                code = row[2] or ""
+                history_index = self._make_history_index(session_id, line_number)
+                if before is not None and history_index >= before:
+                    continue
+                entries.append({
+                    "historyIndex": history_index,
+                    "code": code,
+                })
+
+            start = max(0, len(entries) - n)
+            return {"entries": entries[start:], "hasMore": start > 0}
+        except Exception:
+            return {"entries": [], "hasMore": False}
+
+    def _make_history_index(self, session_id: int, line_number: int) -> int:
+        return (int(session_id) << 32) | int(line_number)
+
     def _extract_name_at_cursor(self, code: str, cursor_pos: int) -> str | None:
         """Extract Python name at cursor."""
         if cursor_pos > len(code):
@@ -902,6 +937,14 @@ def main():
             elif cmd == "is_complete":
                 result = worker.is_complete(code=request.get("code", ""))
                 response = {"type": "is_complete", "result": result}
+
+            elif cmd == "history":
+                result = worker.get_history(
+                    n=request.get("n", 20),
+                    pattern=request.get("pattern"),
+                    before=request.get("before"),
+                )
+                response = {"type": "history", "result": result}
 
             elif cmd == "shutdown":
                 response = {"type": "shutdown", "success": True}
