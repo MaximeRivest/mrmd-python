@@ -1102,33 +1102,538 @@ class IPythonWorker:
         """Get completions at cursor position."""
         self._ensure_initialized()
 
+        # Check if we're inside a function call — if so, inject
+        # parameter name completions and filter out noise.
+        # Done outside the try/except so an IPython crash doesn't lose params.
+        param_items, call_info = self._param_completions(code, cursor_pos)
+
         try:
             from IPython.core.completer import provisionalcompleter
 
+            # Clamp cursor to valid range for IPython
+            safe_cursor = min(cursor_pos, len(code))
+
             with provisionalcompleter():
-                completions = list(self.shell.Completer.completions(code, cursor_pos))
+                completions = list(self.shell.Completer.completions(code, safe_cursor))
 
             if completions:
                 items = []
+
+                # When inside a function call, filter out filesystem paths
+                # and irrelevant globals. Keep only: param names from
+                # signature, plus completions that look like valid Python
+                # identifiers (variables, functions, etc.)
+                in_call = call_info is not None
+                seen_labels = set()
+
+                # Parameter completions go first
+                for p in param_items:
+                    seen_labels.add(p.label)
+                    items.append(p)
+
                 for c in completions:
+                    if c.text in seen_labels:
+                        continue
+
+                    # Inside function calls, skip filesystem completions
+                    # (contain /, ., or look like paths/filenames)
+                    if in_call and self._looks_like_path(c.text):
+                        continue
+
                     kind = self._map_completion_type(c.type) if c.type else "variable"
+                    detail, documentation, sort_prefix = self._completion_detail(
+                        c.text, c.type, code, cursor_pos
+                    )
+                    # When inside a call, push non-param completions below params
+                    if in_call and param_items:
+                        sort_prefix = "c" + sort_prefix
+
                     items.append(
                         CompletionItem(
                             label=c.text,
                             kind=kind,
                             type=c.type,
+                            detail=detail,
+                            documentation=documentation,
+                            sortText=sort_prefix + c.text,
                         )
                     )
+
+                cursor_start = completions[0].start if completions else cursor_pos
+                cursor_end = completions[0].end if completions else cursor_pos
+
+                # If we only have param completions (no IPython matches),
+                # set the range to cover any partial text before cursor
+                if not completions and param_items:
+                    # Find where the current token starts
+                    token_start = cursor_pos
+                    while token_start > 0 and code[token_start - 1:token_start].isalnum() or (
+                        token_start > 0 and code[token_start - 1:token_start] == '_'
+                    ):
+                        token_start -= 1
+                    cursor_start = token_start
+                    cursor_end = cursor_pos
+
                 return CompleteResult(
                     matches=items,
-                    cursorStart=completions[0].start,
-                    cursorEnd=completions[0].end,
+                    cursorStart=cursor_start,
+                    cursorEnd=cursor_end,
+                    source="runtime",
+                )
+            elif param_items:
+                # No IPython completions but we have param completions
+                token_start = cursor_pos
+                while token_start > 0 and (code[token_start - 1:token_start].isalnum()
+                                           or code[token_start - 1:token_start] == '_'):
+                    token_start -= 1
+                return CompleteResult(
+                    matches=param_items,
+                    cursorStart=token_start,
+                    cursorEnd=cursor_pos,
                     source="runtime",
                 )
         except Exception:
             pass
 
         return CompleteResult(cursorStart=cursor_pos, cursorEnd=cursor_pos)
+
+    def _param_completions(
+        self, code: str, cursor_pos: int
+    ) -> tuple[list[CompletionItem], dict | None]:
+        """Detect if cursor is inside a function call and return parameter
+        name completions (e.g., dtype=, order=, copy=).
+
+        Returns (items, call_info) where call_info is None if not in a call.
+        """
+        call_info = self._find_enclosing_call(code, cursor_pos)
+        if not call_info:
+            return [], None
+
+        func_name = call_info["func_name"]
+        existing_kwargs = call_info["existing_kwargs"]
+        prefix = call_info["prefix"]
+
+        # Resolve the function object and get its parameters
+        try:
+            obj = eval(func_name, {"__builtins__": __builtins__}, self.shell.user_ns)
+        except Exception:
+            return [], call_info
+
+        params = self._extract_params(obj)
+        if not params:
+            return [], call_info
+
+        items = []
+        for entry in params:
+            name = entry[0]
+            detail = entry[1] if len(entry) > 1 else None
+            doc = entry[2] if len(entry) > 2 else None
+
+            if name in existing_kwargs:
+                continue
+
+            kw_label = f"{name}="
+            if prefix and not kw_label.startswith(prefix):
+                continue
+
+            items.append(
+                CompletionItem(
+                    label=kw_label,
+                    insertText=kw_label,
+                    kind="field",
+                    detail=detail or name,
+                    documentation=doc,
+                    sortText=f"0{name}",  # sort before everything
+                )
+            )
+
+        return items, call_info
+
+    @staticmethod
+    def _extract_params(obj) -> list[tuple[str, str | None]]:
+        """Extract parameter names and detail strings from a callable.
+
+        Tries inspect.signature() first, falls back to parsing the
+        docstring signature for C builtins like np.array.
+
+        Returns list of (name, detail) tuples. Skips *args/**kwargs.
+        """
+        import inspect
+        import re
+
+        # Strategy 1: inspect.signature (works for pure Python functions)
+        try:
+            sig = inspect.signature(obj)
+            params = []
+            has_only_var = True  # Track if signature is only *args/**kwargs
+            for name, p in sig.parameters.items():
+                if p.kind in (p.VAR_POSITIONAL, p.VAR_KEYWORD):
+                    continue
+                has_only_var = False
+                detail = name
+                ann = ""
+                if p.annotation is not p.empty:
+                    try:
+                        ann = (
+                            p.annotation.__name__
+                            if hasattr(p.annotation, "__name__")
+                            else str(p.annotation)
+                        )
+                    except Exception:
+                        pass
+                if p.default is not p.empty:
+                    default_repr = repr(p.default)
+                    if len(default_repr) > 50:
+                        default_repr = default_repr[:50] + "…"
+                    detail = f"{name}: {ann} = {default_repr}" if ann else f"{name}={default_repr}"
+                elif ann:
+                    detail = f"{name}: {ann}"
+                params.append((name, detail))
+            # If we got real params (not just *args/**kwargs), use them.
+            # Enrich with per-param docs from docstring.
+            if params and not has_only_var:
+                doc = inspect.getdoc(obj)
+                if doc:
+                    doc_params = IPythonWorker._parse_docstring_params(doc)
+                    doc_map = {dp[0]: dp[2] for dp in doc_params if len(dp) > 2}
+                    params = [(n, d, doc_map.get(n)) for n, d in params]
+                else:
+                    params = [(n, d, None) for n, d in params]
+                return params
+        except (ValueError, TypeError):
+            pass
+
+        # Strategy 2: Parse Args/Parameters section from docstring.
+        # Handles **kwargs functions where the docstring documents the
+        # actual accepted keyword arguments.
+        doc = inspect.getdoc(obj)
+        if doc:
+            doc_params = IPythonWorker._parse_docstring_params(doc)
+            if doc_params:
+                return doc_params
+
+        # Strategy 3: Parse the docstring signature for C builtins.
+        # e.g., "array(object, dtype=None, *, copy=True, order='K', ...)"
+        # The signature may span multiple lines (numpy style).
+        doc = inspect.getdoc(obj)
+        if not doc:
+            return []
+
+        # Join continuation lines: collect lines until we find the closing ')'
+        lines = doc.split("\n")
+        sig_text = ""
+        for line in lines:
+            sig_text += " " + line.strip()
+            if ")" in sig_text:
+                break
+
+        sig_text = sig_text.strip()
+        # Match "funcname(params...)"
+        m = re.match(r'[\w.]+\((.+)\)', sig_text)
+        if not m:
+            return []
+
+        arg_str = m.group(1)
+
+        # Also parse the Parameters section for per-param docs
+        doc_params = IPythonWorker._parse_docstring_params(doc)
+        doc_map = {dp[0]: dp for dp in doc_params}
+
+        params = []
+        # Split on commas, respecting brackets and parens
+        depth = 0
+        current = ""
+        for ch in arg_str + ",":
+            if ch in "([{":
+                depth += 1
+                current += ch
+            elif ch in ")]}":
+                depth -= 1
+                current += ch
+            elif ch == "," and depth == 0:
+                token = current.strip()
+                current = ""
+                if not token or token == "*" or token == "/":
+                    continue
+                if token.startswith("*") or token.startswith("**"):
+                    continue
+                # Parse "name=default" or "name"
+                eq = token.find("=")
+                if eq >= 0:
+                    name = token[:eq].strip().rstrip(": ")
+                    colon = name.find(":")
+                    if colon >= 0:
+                        name = name[:colon].strip()
+                else:
+                    colon = token.find(":")
+                    if colon >= 0:
+                        name = token[:colon].strip()
+                    else:
+                        name = token.strip()
+
+                # Get per-param doc from Parameters section
+                dp = doc_map.get(name)
+                detail = dp[1] if dp and len(dp) > 1 and dp[1] else token
+                pdoc = dp[2] if dp and len(dp) > 2 else None
+                params.append((name, detail, pdoc))
+            else:
+                current += ch
+
+        return params
+
+    def _find_enclosing_call(self, code: str, cursor_pos: int) -> dict | None:
+        """Find the function being called at cursor position.
+
+        Walks backward from cursor to find the matching unmatched '(',
+        then extracts the function name.
+
+        Returns {func_name, existing_kwargs, prefix} or None.
+        """
+        text = code[:cursor_pos]
+
+        # Find the unmatched open paren
+        depth = 0
+        paren_pos = -1
+        i = len(text) - 1
+        while i >= 0:
+            ch = text[i]
+            if ch == ')':
+                depth += 1
+            elif ch == '(':
+                if depth == 0:
+                    paren_pos = i
+                    break
+                depth -= 1
+            i -= 1
+
+        if paren_pos < 0:
+            return None
+
+        # Extract the function name before the '('
+        # Walk backward from paren to get e.g. "np.array", "dspy.configure"
+        func_end = paren_pos
+        j = paren_pos - 1
+        while j >= 0 and (text[j].isalnum() or text[j] in '._'):
+            j -= 1
+        func_name = text[j + 1 : func_end].strip()
+        if not func_name:
+            return None
+
+        # Extract text inside the parens (to find already-used kwargs)
+        inside = text[paren_pos + 1 :]
+        existing_kwargs = set()
+        # Simple regex to find "name=" patterns (not inside strings)
+        import re
+        for m in re.finditer(r'(?<![=!<>])(\w+)\s*=(?!=)', inside):
+            existing_kwargs.add(m.group(1))
+
+        # Extract the current prefix (what user is typing for this arg)
+        # Find text after last comma or after '('
+        after_last_sep = inside
+        for sep_pos in range(len(inside) - 1, -1, -1):
+            if inside[sep_pos] in ',(':
+                after_last_sep = inside[sep_pos + 1 :]
+                break
+        prefix = after_last_sep.strip()
+
+        return {
+            "func_name": func_name,
+            "existing_kwargs": existing_kwargs,
+            "prefix": prefix,
+        }
+
+    @staticmethod
+    def _parse_docstring_params(doc: str) -> list[tuple[str, str | None, str | None]]:
+        """Parse parameter names and their full descriptions from a docstring.
+
+        Returns list of (name, detail, documentation) tuples.
+
+        Supports google-style:
+            Args:
+                name (type): description
+                    continued description
+
+        And numpy-style:
+            Parameters
+            ----------
+            name : type
+                description
+                continued description
+        """
+        import re
+
+        lines = doc.split("\n")
+        params: list[tuple[str, str | None, str | None]] = []
+        in_section = False
+        section_indent = 0
+        # Track current param being collected
+        current_name: str | None = None
+        current_detail: str | None = None
+        current_doc_lines: list[str] = []
+        param_indent: int | None = None  # indent of param definition lines
+
+        def flush_param():
+            nonlocal current_name, current_detail, current_doc_lines
+            if current_name:
+                doc_text = "\n".join(current_doc_lines).strip() or None
+                params.append((current_name, current_detail, doc_text))
+            current_name = None
+            current_detail = None
+            current_doc_lines = []
+
+        for i, line in enumerate(lines):
+            stripped = line.strip()
+            line_indent = len(line) - len(line.lstrip()) if stripped else 999
+
+            # Detect section headers
+            if re.match(r'^(Args|Arguments|Parameters|Params|Keyword Args|Keyword Arguments):?\s*$', stripped, re.IGNORECASE):
+                flush_param()
+                in_section = True
+                section_indent = line_indent
+                param_indent = None
+                # numpy-style: skip the "----" underline
+                if i + 1 < len(lines) and re.match(r'^-+\s*$', lines[i + 1].strip()):
+                    continue
+                continue
+
+            if not in_section:
+                continue
+
+            # Detect end of section (new section header or dedent)
+            if stripped and line_indent <= section_indent and not stripped.startswith('-'):
+                if re.match(r'^[A-Z][\w\s]+:?\s*$', stripped):
+                    flush_param()
+                    in_section = False
+                    continue
+
+            # Empty line inside section
+            if not stripped:
+                if current_name:
+                    current_doc_lines.append("")
+                continue
+
+            # Skip *args/**kwargs entries themselves
+            if stripped.startswith('**') or stripped.startswith('*'):
+                continue
+
+            # Try to match a new parameter definition
+            # Google-style: "name (type): description" or "name: description"
+            m = re.match(r'^([a-z_]\w*)\s*(?:\(([^)]*)\))?\s*:\s*(.*)', stripped)
+            if not m:
+                # Numpy-style: "name : type"
+                m = re.match(r'^([a-z_]\w*)\s*:\s*(.+)', stripped)
+                if m:
+                    # Numpy-style matched — type is group 2
+                    flush_param()
+                    current_name = m.group(1)
+                    ptype = m.group(2).strip()
+                    current_detail = f"{current_name}: {ptype}"
+                    param_indent = line_indent
+                    continue
+
+            if m and m.lastindex and m.lastindex >= 1:
+                # Check if this is at the param indent level (not a continuation)
+                if param_indent is not None and line_indent > param_indent + 2:
+                    # This is a continuation line, not a new param
+                    if current_name:
+                        current_doc_lines.append(stripped)
+                    continue
+
+                flush_param()
+                current_name = m.group(1)
+                ptype = m.group(2) if m.lastindex >= 2 and m.group(2) else ""
+                desc = m.group(m.lastindex).strip() if m.lastindex >= 2 else (m.group(2) or "").strip()
+
+                # For google-style with 3 groups: name, type, desc
+                if m.lastindex >= 3:
+                    ptype = m.group(2) or ""
+                    desc = m.group(3).strip()
+
+                if ptype:
+                    current_detail = f"{current_name}: {ptype}"
+                else:
+                    current_detail = current_name
+                if desc:
+                    current_doc_lines.append(desc)
+                if param_indent is None:
+                    param_indent = line_indent
+                continue
+
+            # Continuation line for the current param's description
+            if current_name and line_indent > (param_indent or 0):
+                current_doc_lines.append(stripped)
+
+        flush_param()
+        return params
+
+    @staticmethod
+    def _looks_like_path(text: str) -> bool:
+        """Check if a completion looks like a filesystem path."""
+        # Contains path separators or file extensions
+        if '/' in text or '\\' in text:
+            return True
+        # Looks like a filename with extension (e.g., AGENTS.md, setup.py)
+        if '.' in text and not text.startswith('.') and not text.startswith('__'):
+            parts = text.rsplit('.', 1)
+            if len(parts) == 2 and parts[1].isalpha() and len(parts[1]) <= 5:
+                # Check it's not a valid Python dotted name in the namespace
+                return True
+        return False
+
+    def _completion_detail(
+        self, label: str, comp_type: str | None, code: str, cursor_pos: int
+    ) -> tuple[str | None, str | None, str]:
+        """Get detail, documentation, and sort prefix for a completion item.
+
+        Returns (detail, documentation, sortPrefix).
+        Keeps it fast — skips expensive lookups for magics/keywords.
+        """
+        # Sort prefix: push IPython magics and dunders to bottom
+        if label.startswith("%%") or label.startswith("%"):
+            return ("IPython magic", None, "z")  # sort last
+        if label.startswith("__") and label.endswith("__"):
+            return (comp_type, None, "y")  # sort near bottom
+        if label.startswith("_"):
+            return (comp_type, None, "x")  # sort below public
+
+        # For real symbols, try to get signature + short docstring.
+        # Build the fully qualified name from the code before the cursor.
+        # Find the last '.' before cursor to get the base object.
+        prefix = code[:cursor_pos]
+        dot_idx = prefix.rfind(".")
+        if dot_idx >= 0:
+            # "dspy.co" → base = "dspy", fqn = "dspy.configure"
+            base = prefix[:dot_idx].rstrip()
+            fqn = f"{base}.{label}"
+        else:
+            fqn = label
+
+        try:
+            obj = eval(fqn, {"__builtins__": {}}, self.shell.user_ns)
+
+            # Detail: type + signature
+            detail = type(obj).__name__
+            if callable(obj):
+                try:
+                    import inspect
+                    sig = inspect.signature(obj)
+                    detail = f"{label}{sig}"
+                except (ValueError, TypeError):
+                    detail = f"{label}(...)"
+
+            # Documentation: first paragraph of docstring
+            doc = None
+            try:
+                import inspect
+                raw_doc = inspect.getdoc(obj)
+                if raw_doc:
+                    doc = raw_doc
+            except Exception:
+                pass
+
+            return (detail, doc, "a")  # "a" = sort first (real matches)
+        except Exception:
+            return (comp_type, None, "b")  # sort normally
 
     def _map_completion_type(self, type_str: str | None) -> str:
         """Map IPython completion type to MRP kind."""
@@ -1175,6 +1680,28 @@ class IPythonWorker:
                 except Exception:
                     pass
 
+            file_path = info.get("file")
+            line_num = info.get("line")
+
+            # IPython often returns file but not line. Use inspect to get both.
+            if not line_num or not file_path:
+                try:
+                    import inspect as _inspect
+                    obj = eval(name, {"__builtins__": {}}, self.shell.user_ns)
+                    # Unwrap decorated functions to get the real source
+                    obj = _inspect.unwrap(obj, stop=(lambda f: hasattr(f, '__code__')))
+                    src_file = _inspect.getfile(obj)
+                    _, src_line = _inspect.getsourcelines(obj)
+                    file_path = file_path or src_file
+                    line_num = line_num or src_line
+                except Exception:
+                    pass
+
+            # Expand ~ in file paths
+            if file_path and file_path.startswith("~"):
+                import os
+                file_path = os.path.expanduser(file_path)
+
             return InspectResult(
                 found=True,
                 source="runtime",
@@ -1184,8 +1711,8 @@ class IPythonWorker:
                 signature=info.get("call_signature") or info.get("init_signature"),
                 docstring=info.get("docstring") if detail >= 1 else None,
                 sourceCode=source_code if detail >= 2 else None,
-                file=info.get("file"),
-                line=info.get("line"),
+                file=file_path,
+                line=line_num,
             )
         except Exception:
             return InspectResult(found=False)

@@ -115,6 +115,7 @@ class CompletionItem:
     documentation: str | None = None
     valuePreview: str | None = None
     type: str | None = None
+    sortText: str | None = None
 
 
 @dataclass
