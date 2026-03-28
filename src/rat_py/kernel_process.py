@@ -1,4 +1,4 @@
-"""Persistent Python kernel process for mrmd-python.
+"""Persistent Python kernel process for rat-py.
 
 This module runs a dedicated runtime process whose *main thread* executes user
 code. Commands arrive over stdin as line-delimited JSON and responses/events are
@@ -872,7 +872,7 @@ class KernelProcess:
 def main() -> int:
     import argparse
 
-    parser = argparse.ArgumentParser(description="mrmd-python kernel process")
+    parser = argparse.ArgumentParser(description="rat-py kernel process")
     parser.add_argument("--cwd", default=None, help="Working directory")
     parser.add_argument("--assets-dir", default=None, help="Assets directory")
     args = parser.parse_args()

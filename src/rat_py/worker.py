@@ -131,11 +131,11 @@ class IPythonWorker:
             return False
         return self._get_venv_python() is not None
 
-    def _ensure_mrmd_python_in_venv(self) -> bool:
-        """Ensure mrmd-python is installed in the target venv.
+    def _ensure_rat_py_in_venv(self) -> bool:
+        """Ensure rat-py is installed in the target venv.
 
-        Uses uv pip install to add mrmd-python to the venv so that
-        the dedicated kernel process can be invoked with -m mrmd_python.kernel_process.
+        Uses uv pip install to add rat-py to the venv so that
+        the dedicated kernel process can be invoked with -m rat_py.kernel_process.
 
         Returns True if successful.
         """
@@ -145,9 +145,9 @@ class IPythonWorker:
         if not python_exe:
             return False
 
-        # Check if mrmd_python is already importable
+        # Check if rat_py is already importable
         check_result = sp.run(
-            [python_exe, "-c", "import mrmd_python"],
+            [python_exe, "-c", "import rat_py"],
             capture_output=True,
             text=True,
         )
@@ -156,10 +156,10 @@ class IPythonWorker:
             # Already installed
             return True
 
-        # Install mrmd-python using uv pip
+        # Install rat-py using uv pip
         try:
             install_result = sp.run(
-                ["uv", "pip", "install", "--python", python_exe, "mrmd-python"],
+                ["uv", "pip", "install", "--python", python_exe, "rat-py"],
                 capture_output=True,
                 text=True,
                 timeout=120,
@@ -169,7 +169,7 @@ class IPythonWorker:
             # uv not available or timeout - try pip directly
             try:
                 install_result = sp.run(
-                    [python_exe, "-m", "pip", "install", "mrmd-python"],
+                    [python_exe, "-m", "pip", "install", "rat-py"],
                     capture_output=True,
                     text=True,
                     timeout=120,
@@ -181,11 +181,11 @@ class IPythonWorker:
     def _get_subprocess_worker(self) -> SubprocessWorker:
         """Get or create the subprocess worker for different-venv execution."""
         if self._subprocess_worker is None or not self._subprocess_worker.is_alive():
-            # Ensure mrmd-python is installed in the target venv
-            if not self._ensure_mrmd_python_in_venv():
+            # Ensure rat-py is installed in the target venv
+            if not self._ensure_rat_py_in_venv():
                 raise RuntimeError(
-                    f"Could not install mrmd-python in venv {self.venv}. "
-                    "Please install it manually: uv pip install mrmd-python"
+                    f"Could not install rat-py in venv {self.venv}. "
+                    "Please install it manually: uv pip install rat-py"
                 )
 
             self._subprocess_worker = SubprocessWorker(

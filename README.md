@@ -1,15 +1,17 @@
-# mrmd-python
+# rat-py
 
-MCP server for live Python execution. 3 tools, persistent state, real-time streaming.
+**Run AnyThing: Python.** MCP server for live Python execution. 3 tools, persistent state, real-time streaming.
+
+Part of the [rat](https://github.com/maximerivest) family: `rat-py`, `rat-r`, `rat-ju`, `rat-sh`, `rat-js` — the same 3 tools for every REPL language, all driven by [mcp2cli](https://github.com/maximerivest/mcp2cli).
 
 ## Install
 
 ```bash
-pip install mrmd-python
-mrmd-python install
+pip install rat-py
+rat-py install
 ```
 
-That's it. `mrmd-python install` registers with [mcp2cli](https://github.com/maximerivest/mcp2cli) automatically.
+That registers with [mcp2cli](https://github.com/maximerivest/mcp2cli) as `py`. Done.
 
 ## Use
 
@@ -24,6 +26,8 @@ py ctl --op reset                      # → RESET | namespace cleared | 0 vars
 
 mcp2cli py down                        # stop
 ```
+
+Everything after `mcp2cli py up` goes through [mcp2cli](https://github.com/maximerivest/mcp2cli). The Python package is just the MCP server — mcp2cli handles the CLI, background process, shell completions, and output formatting.
 
 ## Tools
 
@@ -113,37 +117,21 @@ py ctl --op restart                    # restart interpreter
 py ctl --op status                     # python idle | exec #5 | rev 17 | up 3600s
 ```
 
-## Shared Runtime
+## mcp2cli features you get for free
 
-One runtime, many clients — terminal, LLM, and notebook share the same namespace:
-
-```bash
-mrmd-python start
-# → Runtime 'my-project' started
-# → MCP: http://127.0.0.1:8717/mcp
-
-# Terminal (via mcp2cli)
-mcp2cli tool py-my-project run --code 'x = 42'
-
-# Claude Desktop / Cursor / notebook — same URL, same x = 42
-```
-
-### Multiple runtimes
+Because rat-py is just an MCP server, [mcp2cli](https://github.com/maximerivest/mcp2cli) gives you all of this automatically:
 
 ```bash
-cd ~/analysis && mrmd-python start          # name: 'analysis', auto port
-cd ~/ml-work && mrmd-python start           # name: 'ml-work', different port
-
-mrmd-python status
-# NAME       PID    PORT   STATE  EXECS  CWD
-# analysis   12345  8717   idle   5      ~/analysis
-# ml-work    12346  8718   idle   3      ~/ml-work
-
-mrmd-python stop --name analysis
-mrmd-python stop --name ml-work
+mcp2cli py up                          # background daemon, instant responses
+mcp2cli py down                        # stop
+mcp2cli py tools                       # list tools
+mcp2cli py tools run                   # inspect a tool's schema
+mcp2cli py shell                       # interactive mode with history + tab completion
+mcp2cli py doctor                      # diagnose problems
+py run 'x = 42' -o json               # JSON output for scripts
 ```
 
-## Connect
+## Connect from other hosts
 
 ### Claude Desktop
 
@@ -151,14 +139,12 @@ mrmd-python stop --name ml-work
 {
   "mcpServers": {
     "python": {
-      "command": "mrmd-python",
+      "command": "rat-py",
       "args": ["--cwd", "/path/to/project"]
     }
   }
 }
 ```
-
-Or run `mrmd-python install` to generate the config.
 
 ### Cursor
 
@@ -166,7 +152,7 @@ Or run `mrmd-python install` to generate the config.
 {
   "mcpServers": {
     "python": {
-      "command": "mrmd-python"
+      "command": "rat-py"
     }
   }
 }
@@ -175,20 +161,20 @@ Or run `mrmd-python install` to generate the config.
 ### MCP Inspector
 
 ```bash
-mrmd-python --http --port 8000
+rat-py --http --port 8000
 # Inspector → Transport: Streamable HTTP → URL: http://127.0.0.1:8000/mcp
 ```
 
 ### Programmatic
 
 ```python
-from mrmd_python import create_mcp_server
+from rat_py import create_mcp_server
 
 mcp = create_mcp_server()
 mcp.run()  # STDIO
 ```
 
-## For Notebook GUIs
+## For notebook GUIs
 
 Same 3 tools serve notebook UIs through MCP:
 
@@ -207,14 +193,12 @@ Same 3 tools serve notebook UIs through MCP:
 - **Variable drill-down** — navigate dicts, lists, objects via dot syntax
 - **Interactive input** — `input()` calls become `run(input="...")` responses
 - **Asset generation** — matplotlib figures, HTML output served at `/assets/{id}`
-- **Named runtimes** — multiple isolated runtimes simultaneously
-- **Shared state** — multiple MCP clients share one namespace
 - **Auto venv detection** — uses current venv or `VIRTUAL_ENV`
 
 ## Architecture
 
 ```
-MCP Client (agent / notebook GUI / mcp2cli)
+MCP Client (mcp2cli / Claude Desktop / Cursor / notebook GUI)
     │
     ├── run(code="...")          ← execute, stream output
     ├── look(at="df")           ← inspect, complete, overview
@@ -229,3 +213,18 @@ RuntimeService (service.py)     ← execution lifecycle, event log
     ▼
 IPythonWorker (worker.py)       ← Python execution engine (subprocess)
 ```
+
+## The rat family
+
+```
+Any language runtime
+    ↓ wrap in MCP (rat-py, rat-r, rat-ju, ...)
+MCP Server
+    ↓ automatic
+├── mcp2cli  → CLI
+├── mcp2py   → Python library
+├── mcp2r    → R library
+└── any MCP host → Claude Desktop, Cursor, notebooks
+```
+
+Same 3 tools — `run`, `look`, `ctl` — for every language. One interface to learn, works everywhere.

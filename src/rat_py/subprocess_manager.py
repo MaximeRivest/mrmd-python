@@ -1,4 +1,4 @@
-"""Kernel process manager for mrmd-python.
+"""Kernel process manager for rat-py.
 
 The parent server keeps HTTP handling in one process and delegates all Python
 runtime state to a persistent child kernel process. User code runs on the child
@@ -101,7 +101,7 @@ class SubprocessWorker:
             env = os.environ.copy()
             env.setdefault("PYTHONUNBUFFERED", "1")
 
-            cmd = [python_exe, "-m", "mrmd_python.kernel_process"]
+            cmd = [python_exe, "-m", "rat_py.kernel_process"]
             if self.cwd:
                 cmd.extend(["--cwd", self.cwd])
             if self.assets_dir:
@@ -138,13 +138,13 @@ class SubprocessWorker:
             threading.Thread(
                 target=self._reader_loop,
                 args=(generation, self._process),
-                name=f"mrmd-python-kernel-reader-{generation}",
+                name=f"rat-py-kernel-reader-{generation}",
                 daemon=True,
             ).start()
             threading.Thread(
                 target=self._stderr_loop,
                 args=(generation, self._process),
-                name=f"mrmd-python-kernel-stderr-{generation}",
+                name=f"rat-py-kernel-stderr-{generation}",
                 daemon=True,
             ).start()
 

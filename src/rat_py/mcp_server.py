@@ -1,5 +1,5 @@
 """
-MRP MCP Server — the primary interface for mrmd-python.
+MCP Server — the primary interface for rat-py (Run AnyThing: Python).
 
 3 tools:
 - py:       run code or provide input (streams stdout/stderr in real-time)
@@ -303,7 +303,7 @@ INSTRUCTIONS = (
 
 def create_mcp_server(
     service: RuntimeService | None = None,
-    name: str = "mrmd-python",
+    name: str = "rat-py",
     **service_kwargs,
 ) -> FastMCP:
     if service is None:

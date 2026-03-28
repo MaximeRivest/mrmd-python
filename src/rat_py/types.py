@@ -230,8 +230,8 @@ class Environment:
 class Capabilities:
     protocol: str = "mrp"
     protocolVersion: str = "0.4.0-draft"
-    runtime: str = "mrmd-python"
-    version: str = "0.4.0"
+    runtime: str = "rat-py"
+    version: str = "0.5.0"
     languages: list[str] = field(default_factory=lambda: ["python", "py", "python3"])
     features: CapabilityFeatures = field(default_factory=CapabilityFeatures)
     environment: Environment = field(default_factory=Environment)
@@ -242,7 +242,7 @@ class Capabilities:
 class Health:
     status: str = "ok"
     state: str = "idle"  # idle, executing, waiting_input
-    runtime: str = "mrmd-python"
+    runtime: str = "rat-py"
     currentExecutionId: str | None = None
     executionCount: int = 0
     stateRevision: int = 0

@@ -37,7 +37,7 @@ def create_app(
 
     # Create FastAPI host
     app = FastAPI(
-        title="mrmd-python",
+        title="rat-py",
         version="0.4.0-draft",
         description="MRP runtime server for Python. Primary API at /mcp.",
         lifespan=mcp_app.lifespan,

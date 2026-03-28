@@ -1,30 +1,21 @@
 {
-  "name": "mrmd-python",
-  "profile": "python",
-  "start": {
-    "cwd": ".",
-    "command": [
-      "uv",
-      "run",
-      "--project",
-      ".",
-      "python",
-      "-m",
-      "mrmd_python",
-      "--foreground",
-      "--managed",
-      "--host",
-      "127.0.0.1",
-      "--port",
-      "{port}"
-    ],
-    "env": {
-      "PYTHONUNBUFFERED": "1"
-    }
+  "name": "rat-py",
+  "version": "0.5.0",
+  "protocol": "mrp",
+  "protocolVersion": "0.4.0-draft",
+  "transport": ["stdio", "http"],
+  "features": {
+    "execute": true,
+    "stream": true,
+    "variables": true,
+    "inspect": true,
+    "complete": true,
+    "input": true,
+    "reset": true,
+    "cancel": true
   },
-  "timeouts": {
-    "startupMs": 20000,
-    "requestMs": 10000,
-    "longRunningMs": 15000
-  }
+  "command": [
+    "rat_py",
+    "--http"
+  ]
 }

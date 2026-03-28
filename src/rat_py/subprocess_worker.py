@@ -13,7 +13,7 @@ Protocol:
 - Stderr is reserved for streaming output during execution
 
 Usage:
-    /path/to/venv/bin/python -m mrmd_python.subprocess_worker --cwd /project --assets-dir /assets
+    /path/to/venv/bin/python -m rat_py.subprocess_worker --cwd /project --assets-dir /assets
 """
 
 import sys
