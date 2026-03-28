@@ -1,134 +1,163 @@
 # mrmd-python
 
-Independent Python runtime for MRMD notebooks. Runs as a daemon process with full GPU memory isolation.
+MCP server for live Python execution. 3 tools, persistent state, real-time streaming.
 
-## Features
+## What it does
 
-- **Independent daemon process** - survives if parent dies, variables persist
-- **GPU memory isolation** - kill daemon to release VRAM (critical for vLLM)
-- **Auto venv detection** - uses current venv or `VIRTUAL_ENV`
-- **Registry-based discovery** - find runtimes via `~/.mrmd/runtimes/`
-- **Full MRP protocol** - execute, completions, inspect, variables, streaming, history
+`mrmd-python` is an MCP server that gives you a live Python runtime. Run code, inspect variables, get completions — all through the Model Context Protocol.
+
+```
+py(code="x = 42; print(x)")    →  42  ✓ 3ms | 1 var
+py_look(at="x")                 →  x: int = 42
+py_look(code="math.sq", cursor=7) →  sqrt  function  sqrt(x, /)
+py_ctl(op="reset")              →  RESET | namespace cleared | 0 vars
+```
+
+## Tools
+
+| Tool | Purpose | Example |
+|------|---------|---------|
+| `py` | Run code or provide input | `py(code="df.head()")` |
+| `py_look` | See variables, inspect symbols, get completions | `py_look()` or `py_look(at="df")` |
+| `py_ctl` | Reset or cancel | `py_ctl(op="reset")` |
+
+### `py` — run code
+
+```
+py(code="for i in range(3): print(i)")
+→ 0
+  1
+  2
+  ✓ 12ms | 1 var
+```
+
+Streams stdout/stderr in real-time via MCP notifications. Handles `input()` calls:
+
+```
+py(code="name = input('Name: ')")  →  INPUT REQUESTED: "Name: "
+py(input="Alice")                   →  ✓ 50ms | 1 var
+```
+
+### `py_look` — see state
+
+```
+py_look()                          # overview + variable table
+py_look(at="df")                   # inspect a symbol
+py_look(at="math.sqrt")           # signature + docstring
+py_look(code="df.hea", cursor=6)  # completions at cursor
+```
+
+### `py_ctl` — control
+
+```
+py_ctl(op="reset")                 # clear namespace
+py_ctl(op="reset", scope="all")   # clear everything
+py_ctl(op="cancel")               # cancel running execution
+```
 
 ## Installation
 
 ```bash
-# With uv
 uv pip install mrmd-python
-
-# Or run directly without installing
-uvx mrmd-python
 ```
 
-## Quick Start
+## Usage
+
+### As an MCP server (STDIO)
 
 ```bash
-# Start a daemon runtime (auto-detects venv)
-mrmd-python
+# With FastMCP CLI
+fastmcp run mrmd_python.mcp_server:create_mcp_server
 
-# The daemon runs in background. Use the API:
-curl http://localhost:PORT/mrp/v1/capabilities
-
-# List running runtimes
-mrmd-python --list
-
-# Kill when done (releases GPU memory)
-mrmd-python --kill default
+# Or directly
+python -c "from mrmd_python.mcp_server import create_mcp_server; create_mcp_server().run()"
 ```
 
-## CLI Reference
+### As an HTTP server
 
 ```bash
-# Start daemon
-mrmd-python                     # Start with ID "default"
-mrmd-python --id vllm           # Start with custom ID
-mrmd-python --venv /path/venv   # Use specific venv
-mrmd-python --port 8000         # Use specific port
-
-# Management
-mrmd-python --list              # List all running runtimes
-mrmd-python --info ID           # Get runtime details
-mrmd-python --kill ID           # Kill a runtime
-mrmd-python --kill-all          # Kill all runtimes
-
-# Development
-mrmd-python --foreground        # Run in foreground (no daemon)
+python -m mrmd_python --port 8000
 ```
 
-## Virtual Environment Detection
+Serves:
+- `/mcp-server/mcp` — MCP Streamable HTTP endpoint
+- `/health` — plain HTTP health check
+- `/assets/{id}` — runtime-generated assets (plots, HTML)
 
-When `--venv` is not specified, mrmd-python auto-detects:
+### With mcp2cli
 
-1. Current venv (if running inside one via `sys.prefix`)
-2. `VIRTUAL_ENV` environment variable
-3. Falls back to system Python
+```bash
+mcp2cli add mrmd-python --command 'fastmcp run mrmd_python.mcp_server:create_mcp_server'
+mcp2cli tool mrmd-python py --code 'print("hello")'
+mcp2cli tool mrmd-python py_look
+```
 
-## API Endpoints
+### With MCP Inspector
 
-All endpoints at `/mrp/v1/`:
+1. Start the HTTP server: `python -m mrmd_python --port 8000`
+2. In Inspector, set Transport Type to **Streamable HTTP**
+3. URL: `http://127.0.0.1:8000/mcp-server/mcp`
+4. Connect
 
-| Endpoint | Method | Purpose |
-|----------|--------|---------|
-| `/capabilities` | GET | Runtime info and features |
-| `/sessions` | GET/POST | List/create sessions |
-| `/sessions/{id}` | GET/DELETE | Get/destroy session |
-| `/execute` | POST | Run code |
-| `/execute/stream` | POST | Run code with SSE streaming |
-| `/complete` | POST | Get completions |
-| `/inspect` | POST | Get symbol documentation |
-| `/hover` | POST | Get hover tooltip |
-| `/variables` | POST | List user variables |
-| `/variables/{name}` | POST | Get variable details |
-| `/is_complete` | POST | Check if code is complete |
-| `/format` | POST | Format code with black |
-| `/history` | POST | Browse persistent IPython history |
+### Programmatic
+
+```python
+from mrmd_python import create_mcp_server, RuntimeService
+
+# Create and run
+mcp = create_mcp_server()
+mcp.run()  # STDIO
+
+# Or with a shared service
+service = RuntimeService(cwd="/path/to/project")
+mcp = create_mcp_server(service=service)
+
+# Or as a FastAPI app
+from mrmd_python import create_app
+app = create_app(cwd="/path/to/project")
+# uvicorn.run(app, host="127.0.0.1", port=8000)
+```
+
+## For notebook GUIs
+
+The same 3 tools serve notebook UIs through MCP:
+
+- **Real-time output**: `py` streams stdout/stderr as MCP logging notifications during execution
+- **Completions**: `py_look(code=buffer, cursor=pos)` returns typed completion items
+- **Hover/inspect**: `py_look(at=symbol)` returns type, value, signature, docstring
+- **Variable explorer**: `py_look()` returns the full variable table
+
+A notebook GUI is just an MCP client that listens to notifications for streaming and calls `py_look` for IDE features.
+
+## Features
+
+- **Persistent state** — variables survive between executions
+- **Real-time streaming** — stdout/stderr via MCP notifications
+- **Live completions** — from actual runtime state, not just static analysis
+- **Symbol inspection** — type, value, signature, docstring, source location
+- **Interactive input** — `input()` calls become `py(input="...")` responses
+- **Asset generation** — matplotlib figures, HTML output served at `/assets/{id}`
+- **Auto venv detection** — uses current venv or `VIRTUAL_ENV`
 
 ## Architecture
 
 ```
-~/.mrmd/
-├── runtimes/
-│   └── {id}.json    # Registry: pid, port, url, venv, cwd
-└── logs/
-    └── {id}.log     # Daemon logs
-```
-
-Each runtime is a fully independent process:
-- Double-forked daemon (survives parent death)
-- Own IPython shell with persistent variables
-- HTTP server on auto-assigned port
-- Registered in `~/.mrmd/runtimes/` for discovery
-
-History is backed by IPython's native persistent history database, so `/history` survives runtime restarts and `POST /reset`.
-
-## GPU Memory Management
-
-For vLLM and other GPU workloads, memory is only released when the process dies:
-
-```bash
-# Load model in runtime
-mrmd-python --id vllm
-# ... use the model ...
-
-# Release GPU memory
-mrmd-python --kill vllm
-```
-
-## Programmatic Usage
-
-```python
-from mrmd_python import create_app
-import uvicorn
-
-# Create app (daemon_mode=True for use inside daemon)
-app = create_app(
-    cwd="/path/to/project",
-    venv="/path/to/venv",
-    daemon_mode=True,
-)
-uvicorn.run(app, host="localhost", port=8000)
+MCP Client (agent / notebook GUI / CLI)
+    │
+    ├── py(code="...")           ← run code, stream output
+    ├── py_look(at="df")        ← inspect, complete, overview
+    └── py_ctl(op="reset")      ← control
+    │
+    ▼
+FastMCP Server (mcp_server.py)
+    │
+    ▼
+RuntimeService (service.py)     ← execution lifecycle, event log, state
+    │
+    ▼
+IPythonWorker (worker.py)       ← actual Python execution engine
 ```
 
 ## Protocol
 
-See [PROTOCOL.md](../mrmd-editor/PROTOCOL.md) for the full MRP specification.
+See the [MRP specification](../spec/mrp-protocol.md) for the full protocol design.
