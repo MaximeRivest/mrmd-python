@@ -16,8 +16,11 @@ import asyncio
 import json
 import re
 from contextlib import asynccontextmanager
+from pathlib import Path
 
 from fastmcp import FastMCP, Context
+from starlette.requests import Request
+from starlette.responses import JSONResponse, FileResponse
 
 from .service import RuntimeService
 
@@ -312,6 +315,28 @@ def create_mcp_server(
         service.shutdown()
 
     mcp = FastMCP(name=name, instructions=INSTRUCTIONS, lifespan=lifespan)
+
+    # ── Custom HTTP routes (served alongside /mcp) ───────────
+
+    @mcp.custom_route("/health", methods=["GET"])
+    async def health_http(request: Request) -> JSONResponse:
+        return JSONResponse(service.get_health())
+
+    @mcp.custom_route("/assets/{asset_id}", methods=["GET"])
+    async def asset_http(request: Request) -> FileResponse | JSONResponse:
+        asset_id = request.path_params["asset_id"]
+        asset_path = service.get_asset_path(asset_id)
+        if asset_path is None:
+            return JSONResponse(
+                {"error": "asset_not_found", "message": f"Asset {asset_id} not found"},
+                status_code=404,
+            )
+        suffix = asset_path.suffix.lower()
+        content_types = {
+            ".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg",
+            ".svg": "image/svg+xml", ".html": "text/html", ".json": "application/json",
+        }
+        return FileResponse(asset_path, media_type=content_types.get(suffix, "application/octet-stream"))
 
     # ── Resources ────────────────────────────────────────────
 

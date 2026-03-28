@@ -150,7 +150,7 @@ def _cmd_start(args):
         )
 
     # Wait for ready
-    url = f"http://{host}:{port}/mcp-server/mcp"
+    url = f"http://{host}:{port}/mcp"
     health_url = f"http://{host}:{port}/health"
 
     ready = False
@@ -447,22 +447,19 @@ def main():
     mcp = create_mcp_server(cwd=cwd, venv=venv, assets_dir=args.assets_dir)
 
     if args.http:
-        from .app import create_app
-        import uvicorn
-
         port = args.port or DEFAULT_PORT
         host = args.host or "127.0.0.1"
-        app = create_app(cwd=cwd, venv=venv, assets_dir=args.assets_dir)
 
         print(f"mrmd-python (HTTP)")
-        print(f"  MCP:    http://{host}:{port}/mcp-server/mcp")
+        print(f"  MCP:    http://{host}:{port}/mcp")
         print(f"  Health: http://{host}:{port}/health")
+        print(f"  Assets: http://{host}:{port}/assets/{{id}}")
         print(f"  cwd:    {cwd}")
         if venv:
             print(f"  venv:   {venv}")
         print()
 
-        uvicorn.run(app, host=host, port=port, log_level="info")
+        mcp.run(transport="streamable-http", host=host, port=port)
     else:
         # Stdio — default for MCP hosts
         mcp.run()

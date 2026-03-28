@@ -125,7 +125,7 @@ One runtime, many clients — terminal, LLM, and notebook all share the same nam
 cd ~/my-project
 mrmd-python start
 # → Runtime 'my-project' started (pid 12345)
-# → MCP: http://127.0.0.1:8717/mcp-server/mcp
+# → MCP: http://127.0.0.1:8717/mcp
 ```
 
 Now from the terminal, Claude Desktop, Cursor, a notebook GUI — all connect to the same URL, all see the same variables.
@@ -208,7 +208,7 @@ mcp2cli tool python py_look
 
 ```bash
 mrmd-python --http --port 8000
-# Inspector → Transport: Streamable HTTP → URL: http://127.0.0.1:8000/mcp-server/mcp
+# Inspector → Transport: Streamable HTTP → URL: http://127.0.0.1:8000/mcp
 ```
 
 ### Programmatic
