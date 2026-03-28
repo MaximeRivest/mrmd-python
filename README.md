@@ -111,9 +111,9 @@ uv pip install mrmd-python
 
 ```bash
 mrmd-python                  # MCP over stdio (for Claude Desktop, Cursor)
-mrmd-python start            # shared runtime server (background, multi-client)
+mrmd-python start            # shared runtime (background, multi-client)
 mrmd-python stop             # stop the shared runtime
-mrmd-python status           # show if running
+mrmd-python status           # show all running runtimes
 mrmd-python install          # show config for Claude Desktop / Cursor / mcp2cli
 ```
 
@@ -124,13 +124,33 @@ One runtime, many clients — terminal, LLM, and notebook all share the same nam
 ```bash
 cd ~/my-project
 mrmd-python start
-# → Runtime started (pid 12345)
+# → Runtime 'my-project' started (pid 12345)
 # → MCP: http://127.0.0.1:8717/mcp-server/mcp
-# → mcp2cli registered and exposed as 'py'
-# → Try: py py "print('hello')"
 ```
 
 Now from the terminal, Claude Desktop, Cursor, a notebook GUI — all connect to the same URL, all see the same variables.
+
+### Multiple runtimes
+
+Each runtime gets a name (defaults to the directory name) and its own port:
+
+```bash
+cd ~/analysis && mrmd-python start            # name: 'analysis', port: 8717
+cd ~/ml-work && mrmd-python start             # name: 'ml-work', port: 8718
+mrmd-python start --name scratch              # explicit name, auto port
+
+mrmd-python status
+# NAME       PID    PORT   STATE  EXECS  CWD
+# analysis   12345  8717   idle   5      ~/analysis
+# ml-work    12346  8718   idle   3      ~/ml-work
+# scratch    12347  8719   idle   0      .
+
+mrmd-python stop --name analysis
+mrmd-python stop --name ml-work
+mrmd-python stop --name scratch
+```
+
+Each runtime is fully isolated — different namespace, can use different venvs. Starting from the same directory with the same name is blocked (one runtime per name).
 
 ### Stdio mode (for single-client MCP hosts)
 
@@ -227,6 +247,8 @@ A notebook GUI is just an MCP client that listens to notifications for streaming
 - **Variable drill-down** — navigate dicts, lists, objects via `py_look(at="data.scores.0")`
 - **Interactive input** — `input()` calls become `py(input="...")` responses
 - **Asset generation** — matplotlib figures, HTML output served at `/assets/{id}`
+- **Named runtimes** — run multiple isolated runtimes simultaneously
+- **Shared state** — multiple MCP clients connect to the same runtime
 - **Auto venv detection** — uses current venv or `VIRTUAL_ENV`
 
 ## Architecture
