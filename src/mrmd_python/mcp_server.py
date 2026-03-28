@@ -294,10 +294,10 @@ async def _stream_until_done(service, execution, ctx):
 
 INSTRUCTIONS = (
     "Python runtime. "
-    "py(code) runs code. "
-    "py_look() shows variables. py_look(at='x') inspects x. "
-    "py_look(code='df.he', cursor=5) completes. "
-    "py_ctl(op='reset') resets."
+    "run(code) runs code. "
+    "look() shows variables. look(at='x') inspects x. "
+    "look(code='df.he', cursor=5) completes. "
+    "ctl(op='reset') resets."
 )
 
 
@@ -351,7 +351,7 @@ def create_mcp_server(
     # ── py ───────────────────────────────────────────────────
 
     @mcp.tool
-    async def py(
+    async def run(
         code: str | None = None,
         input: str | None = None,
         allow_input: bool = True,
@@ -413,7 +413,7 @@ def create_mcp_server(
     # ── py_look ──────────────────────────────────────────────
 
     @mcp.tool
-    def py_look(
+    def look(
         at: str | None = None,
         code: str | None = None,
         cursor: int | None = None,
@@ -448,7 +448,7 @@ def create_mcp_server(
     # ── py_ctl ───────────────────────────────────────────────
 
     @mcp.tool
-    def py_ctl(op: str, scope: str = "namespace") -> str:
+    def ctl(op: str, scope: str = "namespace") -> str:
         """Control the runtime.
 
         op="reset": clear namespace (scope: "namespace", "history", "assets", or "all").

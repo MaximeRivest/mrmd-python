@@ -197,16 +197,21 @@ def _cmd_start(args):
     # Auto-register with mcp2cli
     _register_mcp2cli(name, url)
 
-    print(f"\n  Stop: mrmd-python stop {name}")
+    print(f"\n  Try: mcp2cli tool {_cli_name(name)} run --code 'print(\"hello\")'")
+    print(f"  Stop: mrmd-python stop {name}")
+
+
+def _cli_name(name: str) -> str:
+    return f"py-{name}" if name != "default" else "py"
 
 
 def _register_mcp2cli(name: str, url: str):
     """Auto-register with mcp2cli if available."""
     if not shutil.which("mcp2cli"):
-        print(f"\n  Connect: mcp2cli add {name} --url {url}")
+        print(f"\n  Connect: mcp2cli add {_cli_name(name)} --url {url}")
         return
 
-    cli_name = f"python-{name}" if name != "default" else "python"
+    cli_name = _cli_name(name)
     try:
         subprocess.run(["mcp2cli", "rm", cli_name], capture_output=True, timeout=5)
         subprocess.run(["mcp2cli", "add", cli_name, "--url", url], capture_output=True, timeout=5)
@@ -226,7 +231,7 @@ def _unregister_mcp2cli(name: str):
     """Remove from mcp2cli."""
     if not shutil.which("mcp2cli"):
         return
-    cli_name = f"python-{name}" if name != "default" else "python"
+    cli_name = _cli_name(name)
     try:
         subprocess.run(["mcp2cli", "unexpose", cli_name], capture_output=True, timeout=5)
         subprocess.run(["mcp2cli", "rm", cli_name], capture_output=True, timeout=5)
@@ -352,33 +357,55 @@ def _show_runtime_status(name: str):
 def _cmd_install(args):
     cwd = args.cwd or os.getcwd()
     venv = args.venv or _find_venv(cwd)
-    state = _read_state(cwd)
+    name = args.name or "py"
 
-    print("# mrmd-python MCP configuration\n")
+    # Determine the command to register — prefer actual binary path
+    venv_bin = os.path.join(venv, "bin", "mrmd-python") if venv else None
+    if venv_bin and os.path.isfile(venv_bin):
+        server_cmd = venv_bin
+    elif shutil.which("mrmd-python"):
+        server_cmd = shutil.which("mrmd-python")
+    else:
+        server_cmd = "uvx mrmd-python"
 
-    # If a runtime is running, show shared URL config
-    if state and _is_alive(state.get("pid", 0)):
-        url = state["url"]
-        print(f"## Runtime is running at {url}\n")
+    # ── mcp2cli registration ─────────────────────────────────
+    if shutil.which("mcp2cli"):
+        print(f"Setting up mcp2cli...")
 
-        print("## Claude Desktop / Cursor / any MCP client")
-        print(json.dumps({"mcpServers": {"python": {"url": url}}}, indent=2))
+        # Remove old registration if exists
+        subprocess.run(["mcp2cli", "rm", name], capture_output=True, timeout=5)
+
+        # Register
+        result = subprocess.run(
+            ["mcp2cli", "add", name, server_cmd],
+            capture_output=True, timeout=10, text=True,
+        )
+        if result.returncode == 0:
+            print(f"  ✓ Registered as '{name}'")
+        else:
+            print(f"  ✗ Registration failed: {result.stderr.strip()}")
+
         print()
-
-        print("## mcp2cli")
-        print(f"mcp2cli add python --url {url}")
+        print(f"Ready! Try:")
+        print(f"  mcp2cli {name} up          # start persistent runtime")
+        print(f"  {name} run 'print(\"hello\")'")
+        print(f"  {name} look")
+        print(f"  {name} ctl --op reset")
+        print(f"  mcp2cli {name} down        # stop")
+    else:
+        print("mcp2cli not found. Install it for CLI access:")
+        print("  curl -fsSL https://raw.githubusercontent.com/MaximeRivest/mcp2cli/main/install.sh | sh")
         print()
-        return
+        print("Then run: mrmd-python install")
 
-    # No runtime running — show stdio config
-    cmd = "mrmd-python"
-    use_uvx = not shutil.which("mrmd-python")
+    # ── Print configs for other MCP hosts ────────────────────
+    print()
+    print("─── Other MCP hosts ───")
+    print()
 
-    print("## Stdio mode (each host gets its own runtime)\n")
-
-    print("## Claude Desktop")
-    entry = {"command": "uvx" if use_uvx else cmd}
-    a = ["mrmd-python"] if use_uvx else []
+    print("Claude Desktop:")
+    entry = {"command": server_cmd.split()[0]}
+    a = server_cmd.split()[1:] if " " in server_cmd else []
     a.extend(["--cwd", cwd])
     if venv:
         a.extend(["--venv", venv])
@@ -386,11 +413,15 @@ def _cmd_install(args):
     print(json.dumps({"mcpServers": {"python": entry}}, indent=2))
     print()
 
-    print("## Shared mode (all clients share one runtime)\n")
-    print("# Start runtime:")
-    print(f"mrmd-python start --cwd {cwd}")
-    print("# Then connect any client to the printed URL")
+    print("Cursor (.cursor/mcp.json):")
+    entry2 = {"command": server_cmd.split()[0]}
+    entry2["args"] = server_cmd.split()[1:] if " " in server_cmd else []
+    print(json.dumps({"mcpServers": {"python": entry2}}, indent=2))
     print()
+
+    print(f"Shared mode (multiple clients, one runtime):")
+    print(f"  mrmd-python start")
+    print(f"  # Then connect any MCP client to the printed URL")
 
 
 # ── Main ─────────────────────────────────────────────────────────
