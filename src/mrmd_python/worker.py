@@ -1969,12 +1969,27 @@ class IPythonWorker:
         self._ensure_initialized()
 
         try:
-            # Navigate path
-            full_path = name
+            # Navigate path — try attribute access, then key/index access
+            value = eval(name, {"__builtins__": {}}, self.shell.user_ns)
             if path:
-                full_path = f"{name}.{'.'.join(path)}"
-
-            value = eval(full_path, {"__builtins__": {}}, self.shell.user_ns)
+                for segment in path:
+                    # Try attribute first
+                    if hasattr(value, segment) and not isinstance(value, (dict, list, tuple)):
+                        value = getattr(value, segment)
+                    # Then try key/index access
+                    elif isinstance(value, dict):
+                        # Try exact key, then numeric key
+                        if segment in value:
+                            value = value[segment]
+                        elif segment.isdigit() and int(segment) in value:
+                            value = value[int(segment)]
+                        else:
+                            # Try attribute as fallback
+                            value = getattr(value, segment)
+                    elif isinstance(value, (list, tuple)) and segment.isdigit():
+                        value = value[int(segment)]
+                    else:
+                        value = getattr(value, segment)
             var = self._make_variable(name, value)
 
             # Get children
@@ -1990,8 +2005,13 @@ class IPythonWorker:
                     if not k.startswith("_"):
                         children.append(self._make_variable(k, v))
 
+            # Use full path as the display name
+            display_name = name
+            if path:
+                display_name = f"{name}.{'.'.join(path)}"
+
             return VariableDetail(
-                name=var.name,
+                name=display_name,
                 type=var.type,
                 value=var.value,
                 size=var.size,

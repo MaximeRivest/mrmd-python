@@ -147,44 +147,72 @@ def _fmt_inspect(r: dict, sym: str) -> str:
     vtype = r.get("type") or ""
     value = r.get("value") or ""
 
-    # Header: name: type
+    # Header: name: type (size)
     h = name
     if vtype:
         h += f": {vtype}"
     if kind and kind not in ("variable", vtype):
         h += f" ({kind})"
+    size = r.get("size")
+    if size:
+        h += f" ({size})"
+    elif r.get("shape"):
+        h += f" {r['shape']}"
+    elif r.get("length") is not None:
+        h += f" ({r['length']} items)"
     lines.append(h)
 
-    # For variables, value is the most important thing
+    # Value
     if kind == "variable" and value:
         lines.append(f"  = {_clip(value, 300)}")
     elif r.get("signature"):
         lines.append(f"  {r['signature']}")
-
-    # Shape/size metadata (useful for data science)
-    if r.get("shape"):
-        lines.append(f"  Shape: {r['shape']}")
-    if r.get("length") is not None:
-        lines.append(f"  Length: {r['length']}")
-    if r.get("size"):
-        lines.append(f"  Size: {r['size']}")
-
-    # For non-variables (functions, classes), show value and location
-    if kind != "variable" and value:
+    elif kind != "variable" and value:
         lines.append(f"  Value: {_clip(value, 200)}")
+
+    # Location
     if r.get("file"):
         loc = r["file"]
         if r.get("line"):
             loc += f":{r['line']}"
         lines.append(f"  Defined in: {loc}")
 
-    # Docstring — only for functions/methods/classes, not for simple variables
+    # Docstring (for functions/methods/classes, not trivial variables)
     if r.get("docstring") and kind in ("function", "method", "class", "module", ""):
         doc = r["docstring"]
-        # Skip very generic docstrings (like int.__doc__)
-        if kind not in ("variable",) or len(doc) < 200:
+        if kind != "variable" or len(doc) < 200:
             lines.append("")
             lines.append(_clip(doc, 500))
+
+    # Children — the drill-down view
+    children = r.get("children")
+    if children:
+        lines.append("")
+        nw = max((len(str(c.get("name", ""))) for c in children[:20]), default=4)
+        tw = max((len(str(c.get("type", ""))) for c in children[:20]), default=4)
+        for c in children[:20]:
+            cname = str(c.get("name", ""))
+            ctype = str(c.get("type", ""))
+            cval = _clip(str(c.get("value", "")), 60)
+            exp = "▸" if c.get("expandable") else " "
+            lines.append(f"  {exp} {cname:<{max(nw,4)}}  {ctype:<{max(tw,4)}}  {cval}")
+        remaining = len(children) - 20
+        if remaining > 0:
+            lines.append(f"  … {remaining} more")
+
+    # Methods and attributes hints
+    methods = r.get("methods")
+    if methods:
+        lines.append("")
+        lines.append(f"  Methods: {', '.join(methods[:10])}")
+        if len(methods) > 10:
+            lines.append(f"  … {len(methods) - 10} more")
+
+    attrs = r.get("attributes")
+    if attrs:
+        lines.append(f"  Attributes: {', '.join(attrs[:10])}")
+        if len(attrs) > 10:
+            lines.append(f"  … {len(attrs) - 10} more")
 
     return "\n".join(lines)
 
@@ -423,20 +451,30 @@ def create_mcp_server(
 
 
 def _do_inspect(service, symbol):
+    """Inspect a symbol. Tries multiple strategies for best result.
+
+    For variables: get_variable (with children) → list_variables → inspect → hover
+    For dotted paths: get_variable with path → inspect → hover → eval via py
+    """
     result = {"found": False}
 
-    # For simple names, try variable detail — gives value + type
-    if re.match(r"^[a-zA-Z_]\w*$", symbol):
+    # Parse name and path: "data" → ("data", []),  "data.scores" → ("data", ["scores"])
+    parts = symbol.split(".")
+    root_name = parts[0]
+    path = parts[1:] if len(parts) > 1 else None
+
+    # 1. Try get_variable — gives children for structured drill-down
+    if re.match(r"^[a-zA-Z_]\w*$", root_name):
         try:
-            d = service.get_variable(name=symbol)
-            if d.get("name"):
+            d = service.get_variable(name=root_name, path=path)
+            if d.get("name") and d.get("type") != "error":
                 d["found"] = True
                 d["kind"] = "variable"
                 result = d
         except (RuntimeError, KeyError):
             pass
 
-    # Also try inspect/hover — may give richer info (signature, docstring)
+    # 2. Try inspect/hover — richer for functions/modules (signature, docstring)
     for fn in [
         lambda: service.inspect(code=symbol, cursor=len(symbol), detail=1),
         lambda: service.hover(code=symbol, cursor=len(symbol)),
@@ -444,8 +482,8 @@ def _do_inspect(service, symbol):
         try:
             r = fn()
             if r.get("found"):
-                # Merge: keep variable detail value, add inspect info
                 if result.get("found"):
+                    # Merge: keep variable detail (children, value), add inspect info
                     for key in ("signature", "docstring", "sourceCode", "file", "line"):
                         if r.get(key) and not result.get(key):
                             result[key] = r[key]
@@ -457,10 +495,10 @@ def _do_inspect(service, symbol):
         except RuntimeError:
             pass
 
-    # If we didn't find anything or got "<not found>", try list_variables
+    # 3. Fallback to list_variables for simple names
     if (not result.get("found") or
-            result.get("value") == "<not found>" or
-            result.get("type") == "unknown"):
+            result.get("value") in ("<not found>", None) or
+            result.get("type") in ("unknown", "error")):
         if re.match(r"^[a-zA-Z_]\w*$", symbol):
             try:
                 vl = service.list_variables()
@@ -469,8 +507,10 @@ def _do_inspect(service, symbol):
                         result["found"] = True
                         result["kind"] = "variable"
                         result["name"] = v["name"]
-                        result["value"] = v.get("value", result.get("value"))
-                        result["type"] = v.get("type", result.get("type"))
+                        if result.get("value") in ("<not found>", None):
+                            result["value"] = v.get("value")
+                        if result.get("type") in ("unknown", "error", None):
+                            result["type"] = v.get("type")
                         for k in ("size", "shape", "dtype", "length", "keys", "expandable"):
                             if v.get(k) is not None:
                                 result[k] = v[k]
@@ -478,7 +518,29 @@ def _do_inspect(service, symbol):
             except RuntimeError:
                 pass
 
-    # Clean up residual "<not found>"
+    # 4. Last resort for dotted paths: eval via execute
+    if not result.get("found") and "." in symbol:
+        try:
+            er = service.execute_sync(
+                code=f"_mrp_val = {symbol}\nprint(type(_mrp_val).__name__, ':', repr(_mrp_val)[:200])\ndel _mrp_val",
+                store_history=False,
+                allow_input=False,
+            )
+            if er.get("success"):
+                stdout = er.get("stdout", "").strip()
+                if ":" in stdout:
+                    vtype, _, vval = stdout.partition(":")
+                    result = {
+                        "found": True,
+                        "kind": "variable",
+                        "name": symbol,
+                        "type": vtype.strip(),
+                        "value": vval.strip().strip("'\""),
+                    }
+        except Exception:
+            pass
+
+    # Clean up
     if result.get("value") == "<not found>":
         result.pop("value", None)
 
