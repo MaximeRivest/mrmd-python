@@ -1,90 +1,96 @@
-"""
-Subprocess Manager - Manages persistent venv subprocess from the server side.
+"""Kernel process manager for mrmd-python.
 
-This module provides SubprocessWorker, which spawns and manages a persistent
-Python subprocess running in a venv. The subprocess holds an IPython shell,
-so variables persist across executions.
-
-Killing the subprocess releases all resources (including GPU memory).
+The parent server keeps HTTP handling in one process and delegates all Python
+runtime state to a persistent child kernel process. User code runs on the child
+process main thread, which gives us normal Python signal/KeyboardInterrupt
+semantics on POSIX and a clean restart fallback everywhere else.
 """
 
-import asyncio
+from __future__ import annotations
+
 import json
 import os
-import sys
+import queue
+import signal
 import subprocess
+import sys
 import threading
 import time
+from collections import deque
 from pathlib import Path
-from typing import Callable, Any
-from dataclasses import dataclass, field
+from types import SimpleNamespace
+from typing import Any, Callable
 
 from .types import (
-    ExecuteResult,
-    ExecuteError,
     Asset,
-    DisplayData,
     CompleteResult,
     CompletionItem,
-    InspectResult,
-    HoverResult,
-    VariablesResult,
-    Variable,
-    VariableDetail,
-    IsCompleteResult,
+    DisplayData,
+    ExecuteError,
+    ExecuteResult,
     HistoryEntry,
     HistoryResult,
+    HoverResult,
+    InspectResult,
+    IsCompleteResult,
+    Variable,
+    VariableDetail,
+    VariablesResult,
 )
 
 
 def get_venv_python(venv_path: str) -> str | None:
-    """Get the Python executable path for a venv."""
+    """Get the Python executable path for a venv or prefix."""
     venv = Path(venv_path)
     if sys.platform == "win32":
-        python_exe = venv / "Scripts" / "python.exe"
+        candidates = [venv / "Scripts" / "python.exe"]
     else:
-        python_exe = venv / "bin" / "python"
-    return str(python_exe) if python_exe.exists() else None
+        candidates = [venv / "bin" / "python", venv / "bin" / "python3"]
+
+    for candidate in candidates:
+        if candidate.exists():
+            return str(candidate)
+    return None
 
 
 class SubprocessWorker:
-    """
-    Manages a persistent Python subprocess running in a venv.
+    """Manage a persistent child kernel process."""
 
-    The subprocess runs subprocess_worker.py and communicates via JSON
-    over stdin/stdout. Variables persist across executions within the
-    subprocess.
+    READY_TIMEOUT = 10.0
+    INTERRUPT_GRACE_PERIOD = 1.5
+    TERMINATE_TIMEOUT = 2.0
 
-    Destroying this worker kills the subprocess, releasing all resources
-    including GPU memory.
-    """
-
-    def __init__(
-        self,
-        venv: str,
-        cwd: str | None = None,
-        assets_dir: str | None = None,
-    ):
+    def __init__(self, venv: str, cwd: str | None = None, assets_dir: str | None = None):
         self.venv = venv
         self.cwd = cwd
         self.assets_dir = assets_dir
 
-        self._process: subprocess.Popen | None = None
-        self._lock = threading.Lock()
-        self._started = False
+        self._process: subprocess.Popen[str] | None = None
         self._pid: int | None = None
+        self._started = False
+        self._generation = 0
 
-        # For reading responses
-        self._response_queue: dict[int, Any] = {}
+        self._state_lock = threading.Lock()
+        self._write_lock = threading.Lock()
+        self._pending: dict[int, queue.Queue[dict[str, Any]]] = {}
         self._request_counter = 0
+        self._ready_event = threading.Event()
+        self._start_error: str | None = None
+        self._stderr_tail: deque[str] = deque(maxlen=200)
+        self._exit_error: dict[str, Any] | None = None
+        self._active_execution_id: int | None = None
+        self._active_execution_done = threading.Event()
+        self._active_execution_done.set()
 
-    def _ensure_started(self):
-        """Ensure the subprocess is running."""
+    # ------------------------------------------------------------------
+    # Process lifecycle
+    # ------------------------------------------------------------------
+
+    def _ensure_started(self) -> None:
         if self._started and self._process and self._process.poll() is None:
             return
 
-        with self._lock:
-            # Double-check after acquiring lock
+        with self._state_lock:
             if self._started and self._process and self._process.poll() is None:
                 return
 
@@ -92,55 +98,221 @@ class SubprocessWorker:
             if not python_exe:
                 raise RuntimeError(f"Could not find Python executable in venv: {self.venv}")
 
-            # Build command
-            cmd = [
-                python_exe,
-                "-m", "mrmd_python.subprocess_worker",
-            ]
+            env = os.environ.copy()
+            env.setdefault("PYTHONUNBUFFERED", "1")
+
+            cmd = [python_exe, "-m", "mrmd_python.kernel_process"]
             if self.cwd:
                 cmd.extend(["--cwd", self.cwd])
             if self.assets_dir:
                 cmd.extend(["--assets-dir", self.assets_dir])
 
-            # Start subprocess
-            self._process = subprocess.Popen(
-                cmd,
-                stdin=subprocess.PIPE,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-                bufsize=1,  # Line buffered
-                cwd=self.cwd,
-            )
+            popen_kwargs: dict[str, Any] = {
+                "stdin": subprocess.PIPE,
+                "stdout": subprocess.PIPE,
+                "stderr": subprocess.PIPE,
+                "text": True,
+                "bufsize": 1,
+                "cwd": self.cwd,
+                "env": env,
+            }
+            if os.name == "nt":
+                creationflags = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+                if creationflags:
+                    popen_kwargs["creationflags"] = creationflags
+            else:
+                popen_kwargs["start_new_session"] = True
 
-            # Wait for ready signal
-            try:
-                ready_line = self._process.stdout.readline()
-                ready = json.loads(ready_line)
-                if ready.get("type") != "ready":
-                    raise RuntimeError(f"Subprocess didn't send ready signal: {ready_line}")
-                self._pid = ready.get("pid")
-                self._started = True
-            except Exception as e:
-                self._process.kill()
-                self._process = None
-                raise RuntimeError(f"Failed to start subprocess: {e}")
+            self._generation += 1
+            generation = self._generation
+            self._ready_event = threading.Event()
+            self._start_error = None
+            self._exit_error = None
+            self._active_execution_id = None
+            self._active_execution_done.set()
 
-    def _send_command(self, command: dict) -> dict:
-        """Send a command and wait for response."""
+            self._process = subprocess.Popen(cmd, **popen_kwargs)
+            self._pid = self._process.pid
+            self._started = False
+
+            threading.Thread(
+                target=self._reader_loop,
+                args=(generation, self._process),
+                name=f"mrmd-python-kernel-reader-{generation}",
+                daemon=True,
+            ).start()
+            threading.Thread(
+                target=self._stderr_loop,
+                args=(generation, self._process),
+                name=f"mrmd-python-kernel-stderr-{generation}",
+                daemon=True,
+            ).start()
+
+        if not self._ready_event.wait(self.READY_TIMEOUT):
+            self._terminate_process_tree(force=True)
+            stderr_text = "".join(self._stderr_tail).strip()
+            detail = self._start_error or stderr_text or "kernel did not become ready"
+            raise RuntimeError(f"Failed to start kernel process: {detail}")
+
+        if not self._started:
+            stderr_text = "".join(self._stderr_tail).strip()
+            detail = self._start_error or stderr_text or "kernel start failed"
+            raise RuntimeError(f"Failed to start kernel process: {detail}")
+
+    def _reader_loop(self, generation: int, process: subprocess.Popen[str]) -> None:
+        assert process.stdout is not None
+        try:
+            for raw_line in process.stdout:
+                line = raw_line.strip()
+                if not line:
+                    continue
+                try:
+                    message = json.loads(line)
+                except json.JSONDecodeError:
+                    with self._state_lock:
+                        if generation == self._generation:
+                            self._stderr_tail.append(f"[protocol] {line}\n")
+                    continue
+
+                msg_type = message.get("type")
+                if msg_type == "ready":
+                    with self._state_lock:
+                        if generation != self._generation:
+                            continue
+                        self._pid = message.get("pid", self._pid)
+                        self._started = True
+                        self._ready_event.set()
+                    continue
+
+                if msg_type in {"response", "event"}:
+                    request_id = message.get("id")
+                    with self._state_lock:
+                        pending = self._pending.get(request_id)
+                    if pending is not None:
+                        pending.put(message)
+                    continue
+
+                if msg_type == "protocol_error":
+                    with self._state_lock:
+                        if generation == self._generation:
+                            self._stderr_tail.append(json.dumps(message) + "\n")
+                    continue
+        finally:
+            with self._state_lock:
+                if generation != self._generation:
+                    return
+                if not self._ready_event.is_set():
+                    self._start_error = "kernel exited before sending ready"
+                    self._ready_event.set()
+            self._handle_process_exit(generation)
+
+    def _stderr_loop(self, generation: int, process: subprocess.Popen[str]) -> None:
+        stderr = process.stderr
+        if stderr is None:
+            return
+        for line in stderr:
+            with self._state_lock:
+                if generation != self._generation:
+                    return
+                self._stderr_tail.append(line)
+
+    def _handle_process_exit(self, generation: int) -> None:
+        with self._state_lock:
+            if generation != self._generation:
+                return
+
+            error_payload = self._exit_error or {
+                "type": "KernelExited",
+                "message": "Kernel process exited unexpectedly",
+                "traceback": [],
+            }
+            pending = list(self._pending.values())
+            self._pending.clear()
+            self._process = None
+            self._pid = None
+            self._started = False
+            self._ready_event.set()
+            self._active_execution_id = None
+            self._active_execution_done.set()
+            self._exit_error = None
+
+        for pending_queue in pending:
+            pending_queue.put({"type": "process_exit", "error": error_payload})
+
+    def _send_message(self, message: dict[str, Any]) -> None:
         self._ensure_started()
+        process = self._process
+        if process is None or process.stdin is None:
+            raise RuntimeError("Kernel process is not available")
 
-        with self._lock:
-            # Send command
-            self._process.stdin.write(json.dumps(command) + "\n")
-            self._process.stdin.flush()
+        line = json.dumps(message, ensure_ascii=False)
+        with self._write_lock:
+            process.stdin.write(line + "\n")
+            process.stdin.flush()
 
-            # Read response
-            response_line = self._process.stdout.readline()
-            if not response_line:
-                raise RuntimeError("Subprocess closed unexpectedly")
+    def _next_request_id(self) -> int:
+        with self._state_lock:
+            self._request_counter += 1
+            return self._request_counter
 
-            return json.loads(response_line)
+    def _create_pending_queue(self, request_id: int) -> queue.Queue[dict[str, Any]]:
+        q: queue.Queue[dict[str, Any]] = queue.Queue()
+        with self._state_lock:
+            self._pending[request_id] = q
+        return q
+
+    def _remove_pending_queue(self, request_id: int) -> None:
+        with self._state_lock:
+            self._pending.pop(request_id, None)
+
+    def _begin_execution(self, request_id: int) -> None:
+        with self._state_lock:
+            self._active_execution_id = request_id
+            self._active_execution_done.clear()
+
+    def _finish_execution(self, request_id: int) -> None:
+        with self._state_lock:
+            if self._active_execution_id == request_id:
+                self._active_execution_id = None
+                self._active_execution_done.set()
+
+    def _request(self, command: dict[str, Any], timeout: float | None = None) -> dict[str, Any]:
+        request_id = self._next_request_id()
+        pending = self._create_pending_queue(request_id)
+        try:
+            self._send_message({"id": request_id, **command})
+            return pending.get(timeout=timeout)
+        finally:
+            self._remove_pending_queue(request_id)
+
+    def _execution_request(self, command: dict[str, Any]) -> tuple[int, queue.Queue[dict[str, Any]]]:
+        request_id = self._next_request_id()
+        pending = self._create_pending_queue(request_id)
+        self._begin_execution(request_id)
+        try:
+            self._send_message({"id": request_id, **command})
+        except Exception:
+            self._finish_execution(request_id)
+            self._remove_pending_queue(request_id)
+            raise
+        return request_id, pending
+
+    def _response_error(self, response: dict[str, Any], default_type: str = "KernelError") -> ExecuteError:
+        err = response.get("error") or {}
+        return ExecuteError(
+            type=err.get("type", default_type),
+            message=err.get("message", "Kernel error"),
+            traceback=err.get("traceback", []),
+            line=err.get("line"),
+            column=err.get("column"),
+        )
+
+    def _execute_error_result(self, response: dict[str, Any], default_type: str = "KernelError") -> ExecuteResult:
+        return ExecuteResult(success=False, error=self._response_error(response, default_type=default_type))
+
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
 
     def execute(
         self,
@@ -149,27 +321,23 @@ class SubprocessWorker:
         exec_id: str | None = None,
         allow_stdin: bool = False,
     ) -> ExecuteResult:
-        """Execute code in the subprocess."""
-        response = self._send_command({
+        request_id, pending = self._execution_request({
             "type": "execute",
             "code": code,
             "storeHistory": store_history,
             "execId": exec_id,
             "allowStdin": allow_stdin,
         })
-
-        if response.get("type") == "error":
-            return ExecuteResult(
-                success=False,
-                error=ExecuteError(
-                    type="SubprocessError",
-                    message=response.get("error", "Unknown error"),
-                    traceback=response.get("traceback", "").split("\n") if response.get("traceback") else [],
-                ),
-            )
-
-        result_data = response.get("result", {})
-        return self._parse_execute_result(result_data)
+        try:
+            response = pending.get()
+            if response.get("type") == "process_exit":
+                return self._execute_error_result(response, default_type="KernelExited")
+            if response.get("error"):
+                return self._execute_error_result(response)
+            return self._parse_execute_result(response.get("result", {}))
+        finally:
+            self._finish_execution(request_id)
+            self._remove_pending_queue(request_id)
 
     def execute_streaming(
         self,
@@ -181,84 +349,85 @@ class SubprocessWorker:
         allow_stdin: bool = True,
         on_event: Callable[[str, dict], None] | None = None,
     ) -> ExecuteResult:
-        """
-        Execute code with streaming output.
+        request_id, pending = self._execution_request({
+            "type": "execute_stream",
+            "code": code,
+            "storeHistory": store_history,
+            "execId": exec_id,
+            "allowStdin": allow_stdin,
+        })
+        accumulated_stdout = ""
+        accumulated_stderr = ""
 
-        For subprocess runtimes we use a line-oriented JSON event stream over
-        stdout, ending with a final `result` or `error` message.
-        """
-        self._ensure_started()
-
-        with self._lock:
-            self._process.stdin.write(json.dumps({
-                "type": "execute_stream",
-                "code": code,
-                "storeHistory": store_history,
-                "execId": exec_id,
-                "allowStdin": allow_stdin,
-            }) + "\n")
-            self._process.stdin.flush()
-
-            accumulated_stdout = ""
-            accumulated_stderr = ""
-
+        try:
             while True:
-                response_line = self._process.stdout.readline()
-                if not response_line:
-                    raise RuntimeError("Subprocess closed unexpectedly")
-
-                response = json.loads(response_line)
+                response = pending.get()
                 response_type = response.get("type")
+
+                if response_type == "process_exit":
+                    return self._execute_error_result(response, default_type="KernelExited")
 
                 if response_type == "event":
                     event_type = response.get("event")
-                    event_data = response.get("data", {})
-                    if event_type in ("stdout", "stderr"):
-                        content = event_data.get("content", "")
+                    data = response.get("data", {})
+
+                    if event_type in {"stdout", "stderr"}:
+                        content = data.get("content", "")
                         if event_type == "stdout":
                             accumulated_stdout += content
                             on_output("stdout", content, accumulated_stdout)
                         else:
                             accumulated_stderr += content
                             on_output("stderr", content, accumulated_stderr)
-                    elif on_event and event_type:
-                        on_event(event_type, event_data)
+                        continue
+
+                    if event_type == "stdin_request" and on_stdin_request is not None:
+                        try:
+                            text = on_stdin_request(SimpleNamespace(**data))
+                        except Exception:
+                            self._send_message({
+                                "type": "input_cancel",
+                                "execId": data.get("execId", exec_id or ""),
+                            })
+                        else:
+                            self._send_message({
+                                "type": "input_response",
+                                "execId": data.get("execId", exec_id or ""),
+                                "text": text,
+                            })
+                        continue
+
+                    if on_event and event_type:
+                        on_event(event_type, data)
                     continue
 
-                if response_type == "error":
-                    return ExecuteResult(
-                        success=False,
-                        error=ExecuteError(
-                            type="SubprocessError",
-                            message=response.get("error", "Unknown error"),
-                            traceback=response.get("traceback", "").split("\n") if response.get("traceback") else [],
-                        ),
-                    )
+                if response.get("error"):
+                    return self._execute_error_result(response)
 
-                if response_type == "result":
-                    result_data = response.get("result", {})
-                    return self._parse_execute_result(result_data)
+                return self._parse_execute_result(response.get("result", {}))
+        finally:
+            self._finish_execution(request_id)
+            self._remove_pending_queue(request_id)
 
     def complete(self, code: str, cursor_pos: int) -> CompleteResult:
-        """Get completions at cursor position."""
-        response = self._send_command({
-            "type": "complete",
-            "code": code,
-            "cursor": cursor_pos,
-        })
-
-        if response.get("type") == "error":
+        response = self._request({"type": "complete", "code": code, "cursor": cursor_pos})
+        if response.get("type") == "process_exit" or response.get("error"):
             return CompleteResult(cursorStart=cursor_pos, cursorEnd=cursor_pos)
 
         result = response.get("result", {})
-        matches = []
-        for m in result.get("matches", []):
-            matches.append(CompletionItem(
-                label=m.get("label", ""),
-                kind=m.get("kind", "variable"),
-                type=m.get("type"),
-            ))
-
+        matches = [
+            CompletionItem(
+                label=item.get("label", ""),
+                insertText=item.get("insertText"),
+                kind=item.get("kind", "variable"),
+                detail=item.get("detail"),
+                documentation=item.get("documentation"),
+                valuePreview=item.get("valuePreview"),
+                type=item.get("type"),
+                sortText=item.get("sortText"),
+            )
+            for item in result.get("matches", [])
+        ]
         return CompleteResult(
             matches=matches,
             cursorStart=result.get("cursorStart", cursor_pos),
@@ -267,15 +436,13 @@ class SubprocessWorker:
         )
 
     def inspect(self, code: str, cursor_pos: int, detail: int = 1) -> InspectResult:
-        """Get detailed info about symbol at cursor."""
-        response = self._send_command({
+        response = self._request({
             "type": "inspect",
             "code": code,
             "cursor": cursor_pos,
             "detail": detail,
         })
-
-        if response.get("type") == "error":
+        if response.get("type") == "process_exit" or response.get("error"):
             return InspectResult(found=False)
 
         result = response.get("result", {})
@@ -290,17 +457,13 @@ class SubprocessWorker:
             sourceCode=result.get("sourceCode"),
             file=result.get("file"),
             line=result.get("line"),
+            value=result.get("value"),
+            children=result.get("children"),
         )
 
     def hover(self, code: str, cursor_pos: int) -> HoverResult:
-        """Get hover tooltip for symbol."""
-        response = self._send_command({
-            "type": "hover",
-            "code": code,
-            "cursor": cursor_pos,
-        })
-
-        if response.get("type") == "error":
+        response = self._request({"type": "hover", "code": code, "cursor": cursor_pos})
+        if response.get("type") == "process_exit" or response.get("error"):
             return HoverResult(found=False)
 
         result = response.get("result", {})
@@ -314,26 +477,25 @@ class SubprocessWorker:
         )
 
     def get_variables(self) -> VariablesResult:
-        """Get user variables."""
-        response = self._send_command({"type": "variables"})
-
-        if response.get("type") == "error":
+        response = self._request({"type": "variables"})
+        if response.get("type") == "process_exit" or response.get("error"):
             return VariablesResult(variables=[], count=0, truncated=False)
 
         result = response.get("result", {})
-        variables = []
-        for v in result.get("variables", []):
-            variables.append(Variable(
-                name=v.get("name", ""),
-                type=v.get("type", ""),
-                value=v.get("value", ""),
-                size=v.get("size"),
-                expandable=v.get("expandable", False),
-                shape=v.get("shape"),
-                dtype=v.get("dtype"),
-                length=v.get("length"),
-            ))
-
+        variables = [
+            Variable(
+                name=item.get("name", ""),
+                type=item.get("type", ""),
+                value=item.get("value", ""),
+                size=item.get("size"),
+                expandable=item.get("expandable", False),
+                shape=item.get("shape"),
+                dtype=item.get("dtype"),
+                length=item.get("length"),
+                keys=item.get("keys"),
+            )
+            for item in result.get("variables", [])
+        ]
         return VariablesResult(
             variables=variables,
             count=result.get("count", len(variables)),
@@ -342,152 +504,206 @@ class SubprocessWorker:
         )
 
     def get_variable_detail(self, name: str, path: list[str] | None = None) -> VariableDetail:
-        """Get detailed info about a variable."""
-        # For now, just return basic info from variables
-        vars_result = self.get_variables()
-        for v in vars_result.variables:
-            if v.name == name:
-                return VariableDetail(
-                    name=v.name,
-                    type=v.type,
-                    value=v.value,
-                    size=v.size,
-                    expandable=v.expandable,
-                    shape=v.shape,
-                    dtype=v.dtype,
-                    length=v.length,
-                )
-        return VariableDetail(name=name, type="unknown", value="<not found>")
+        response = self._request({"type": "variable_detail", "name": name, "path": path or []})
+        if response.get("type") == "process_exit" or response.get("error"):
+            return VariableDetail(name=name, type="unknown", value="<not found>")
+
+        result = response.get("result", {})
+        children = [
+            Variable(
+                name=item.get("name", ""),
+                type=item.get("type", ""),
+                value=item.get("value", ""),
+                size=item.get("size"),
+                expandable=item.get("expandable", False),
+                shape=item.get("shape"),
+                dtype=item.get("dtype"),
+                length=item.get("length"),
+                keys=item.get("keys"),
+            )
+            for item in result.get("children", []) or []
+        ]
+        return VariableDetail(
+            name=result.get("name", name),
+            type=result.get("type", "unknown"),
+            value=result.get("value", ""),
+            size=result.get("size"),
+            expandable=result.get("expandable", False),
+            shape=result.get("shape"),
+            dtype=result.get("dtype"),
+            length=result.get("length"),
+            keys=result.get("keys"),
+            fullValue=result.get("fullValue"),
+            children=children or None,
+            methods=result.get("methods"),
+            attributes=result.get("attributes"),
+        )
 
     def is_complete(self, code: str) -> IsCompleteResult:
-        """Check if code is a complete statement."""
-        response = self._send_command({
-            "type": "is_complete",
-            "code": code,
-        })
-
-        if response.get("type") == "error":
+        response = self._request({"type": "is_complete", "code": code})
+        if response.get("type") == "process_exit" or response.get("error"):
             return IsCompleteResult(status="unknown")
 
         result = response.get("result", {})
-        return IsCompleteResult(
-            status=result.get("status", "unknown"),
-            indent=result.get("indent", ""),
-        )
+        return IsCompleteResult(status=result.get("status", "unknown"), indent=result.get("indent", ""))
 
     def format_code(self, code: str) -> tuple[str, bool]:
-        """Format code using black (not implemented in subprocess yet)."""
-        # Could implement this in subprocess_worker if needed
-        return code, False
+        response = self._request({"type": "format", "code": code})
+        if response.get("type") == "process_exit" or response.get("error"):
+            return code, False
 
-    def get_history(
-        self,
-        n: int = 20,
-        pattern: str | None = None,
-        before: int | None = None,
-    ) -> HistoryResult:
-        """Get persistent IPython history from the subprocess."""
-        response = self._send_command({
-            "type": "history",
-            "n": n,
-            "pattern": pattern,
-            "before": before,
-        })
+        result = response.get("result", {})
+        return result.get("formatted", code), result.get("changed", False)
 
-        if response.get("type") == "error":
+    def get_history(self, n: int = 20, pattern: str | None = None, before: int | None = None) -> HistoryResult:
+        response = self._request({"type": "history", "n": n, "pattern": pattern, "before": before})
+        if response.get("type") == "process_exit" or response.get("error"):
             return HistoryResult(entries=[], hasMore=False)
 
         result = response.get("result", {})
         entries = [
-            HistoryEntry(
-                historyIndex=entry.get("historyIndex", 0),
-                code=entry.get("code", ""),
-            )
-            for entry in result.get("entries", [])
+            HistoryEntry(historyIndex=item.get("historyIndex", 0), code=item.get("code", ""))
+            for item in result.get("entries", [])
         ]
         return HistoryResult(entries=entries, hasMore=result.get("hasMore", False))
 
-    def reset(self):
-        """Reset the namespace."""
-        self._send_command({"type": "reset"})
+    def reset(self) -> None:
+        self._request({"type": "reset"})
 
     def clear_history(self) -> bool:
-        """Clear execution history."""
-        response = self._send_command({"type": "clear_history"})
-        return response.get("success", False)
+        response = self._request({"type": "clear_history"})
+        if response.get("type") == "process_exit" or response.get("error"):
+            return False
+        return bool(response.get("result", {}).get("success", False))
 
-    def get_info(self) -> dict:
-        """Get info about this worker."""
+    def supports_busy_introspection(self) -> bool:
+        """Whether this worker can safely answer best-effort introspection while busy."""
+        return True
+
+    def get_info(self) -> dict[str, Any]:
         python_exe = get_venv_python(self.venv)
         return {
             "python_executable": python_exe,
             "venv": self.venv,
             "cwd": self.cwd,
             "pid": self._pid,
-            "running": self._process is not None and self._process.poll() is None,
+            "running": self.is_alive(),
         }
 
-    def shutdown(self):
-        """Shutdown the subprocess, using force kill to ensure GPU memory release.
+    def shutdown(self) -> None:
+        self._terminate_process_tree(force=True)
 
-        This MUST kill the process to release GPU memory for vLLM workloads.
-        We use kill() (SIGKILL) directly to ensure the process dies immediately.
-        """
-        if self._process is None:
-            return
-
-        pid = self._pid  # Save for logging
-
-        # Force kill immediately - don't bother with graceful shutdown
-        # GPU memory release requires the process to actually die
-        try:
-            self._process.kill()  # SIGKILL
-        except Exception:
-            pass
-
-        try:
-            self._process.wait(timeout=2.0)
-        except Exception:
-            pass
-
-        # Reset state
-        self._process = None
-        self._started = False
-        self._pid = None
-
-    def kill(self):
-        """Force kill the subprocess."""
-        if self._process:
-            try:
-                self._process.kill()
-                self._process.wait(timeout=1.0)
-            except Exception:
-                pass
-            finally:
-                self._process = None
-                self._started = False
-                self._pid = None
+    def kill(self) -> None:
+        self._terminate_process_tree(force=True)
 
     def interrupt(self) -> bool:
-        """Send SIGINT to the subprocess to raise KeyboardInterrupt.
+        process = self._process
+        if process is None or process.poll() is not None:
+            return False
 
-        Returns True if signal was sent successfully.
-        """
-        if self._process and self._process.poll() is None:
+        with self._state_lock:
+            active_execution = self._active_execution_id
+
+        if active_execution is None:
+            return False
+
+        interrupted = True
+        try:
+            response = self._request({"type": "interrupt"}, timeout=1.0)
+            if response.get("type") != "process_exit":
+                interrupted = bool(response.get("result", {}).get("interrupted", True))
+        except Exception:
+            interrupted = True
+
+        self._send_soft_interrupt(process)
+
+        if self._active_execution_done.wait(timeout=self.INTERRUPT_GRACE_PERIOD):
+            return interrupted
+
+        with self._state_lock:
+            self._exit_error = {
+                "type": "Interrupted",
+                "message": "Execution interrupted; kernel restarted",
+                "traceback": [],
+            }
+        self._terminate_process_tree(force=False)
+        return True
+
+    def _send_soft_interrupt(self, process: subprocess.Popen[str]) -> None:
+        if process.poll() is not None:
+            return
+        if os.name == "nt":
             try:
-                import signal
-                self._process.send_signal(signal.SIGINT)
-                return True
+                ctrl_break = getattr(signal, "CTRL_BREAK_EVENT", None)
+                if ctrl_break is not None:
+                    process.send_signal(ctrl_break)
             except Exception:
                 pass
-        return False
+            return
+
+        try:
+            os.killpg(process.pid, signal.SIGINT)
+        except Exception:
+            try:
+                process.send_signal(signal.SIGINT)
+            except Exception:
+                pass
+
+    def _terminate_process_tree(self, force: bool) -> None:
+        process = self._process
+        if process is None:
+            return
+        if process.poll() is not None:
+            self._handle_process_exit(self._generation)
+            return
+
+        if os.name == "nt":
+            if force:
+                try:
+                    subprocess.run(
+                        ["taskkill", "/PID", str(process.pid), "/T", "/F"],
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
+                        timeout=5,
+                        check=False,
+                    )
+                except Exception:
+                    try:
+                        process.kill()
+                    except Exception:
+                        pass
+            else:
+                try:
+                    process.terminate()
+                except Exception:
+                    pass
+        else:
+            sig = signal.SIGKILL if force else signal.SIGTERM
+            try:
+                os.killpg(process.pid, sig)
+            except Exception:
+                try:
+                    process.send_signal(sig)
+                except Exception:
+                    pass
+
+        try:
+            process.wait(timeout=self.TERMINATE_TIMEOUT)
+        except Exception:
+            if not force:
+                self._terminate_process_tree(force=True)
+                return
+
+        self._handle_process_exit(self._generation)
 
     def is_alive(self) -> bool:
-        """Check if subprocess is still running."""
         return self._process is not None and self._process.poll() is None
 
-    def _parse_execute_result(self, data: dict) -> ExecuteResult:
-        """Parse execute result from subprocess response."""
+    # ------------------------------------------------------------------
+    # Parsing helpers
+    # ------------------------------------------------------------------
+
+    def _parse_execute_result(self, data: dict[str, Any]) -> ExecuteResult:
         error = None
         if data.get("error"):
             err = data["error"]
@@ -499,22 +715,21 @@ class SubprocessWorker:
                 column=err.get("column"),
             )
 
-        assets = []
-        for a in data.get("assets", []):
-            assets.append(Asset(
-                id=a.get("id", ""),
-                url=a.get("url", ""),
-                mimeType=a.get("mimeType", ""),
-                assetType=a.get("assetType", ""),
-                size=a.get("size", 0),
-            ))
+        assets = [
+            Asset(
+                id=item.get("id", ""),
+                url=item.get("url", ""),
+                mimeType=item.get("mimeType", ""),
+                assetType=item.get("assetType", "file"),
+                size=item.get("size", 0),
+            )
+            for item in data.get("assets", [])
+        ]
 
-        display_data = []
-        for d in data.get("displayData", []):
-            display_data.append(DisplayData(
-                data=d.get("data", {}),
-                metadata=d.get("metadata", {}),
-            ))
+        display_data = [
+            DisplayData(data=item.get("data", {}), metadata=item.get("metadata", {}))
+            for item in data.get("displayData", [])
+        ]
 
         return ExecuteResult(
             success=data.get("success", False),
@@ -527,9 +742,12 @@ class SubprocessWorker:
             executionCount=data.get("executionCount", 0),
             stateRevision=data.get("stateRevision", 0),
             duration=data.get("duration"),
+            imports=data.get("imports", []),
             warnings=data.get("warnings", []),
         )
 
-    def __del__(self):
-        """Cleanup on garbage collection."""
-        self.shutdown()
+    def __del__(self) -> None:
+        try:
+            self.shutdown()
+        except Exception:
+            pass

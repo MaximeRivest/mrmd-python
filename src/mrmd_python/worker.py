@@ -114,31 +114,28 @@ class IPythonWorker:
         return None
 
     def _should_use_subprocess(self) -> bool:
-        """Check if we should use subprocess for execution (different venv).
+        """Check if we should use the dedicated kernel subprocess.
 
-        Returns True if:
-        - A venv is configured
-        - The venv differs from the current Python's prefix
-        - The venv's Python executable exists
+        The kernel subprocess is now the default execution model whenever we
+        have a usable Python executable for the configured environment. This
+        keeps user code on the main thread of its own runtime process, which is
+        the only robust foundation for interrupts, especially around blocking
+        calls and native extensions.
+
+        Set ``MRMD_PYTHON_EMBEDDED=1`` to force legacy in-process execution for
+        debugging.
         """
+        if os.environ.get("MRMD_PYTHON_EMBEDDED") == "1":
+            return False
         if not self.venv:
             return False
-
-        # Compare venv path to current Python's prefix (use realpath to handle symlinks)
-        current_prefix = os.path.realpath(sys.prefix)
-        target_venv = os.path.realpath(self.venv)
-
-        if current_prefix == target_venv:
-            return False
-
-        # Verify the target Python exists
         return self._get_venv_python() is not None
 
     def _ensure_mrmd_python_in_venv(self) -> bool:
         """Ensure mrmd-python is installed in the target venv.
 
         Uses uv pip install to add mrmd-python to the venv so that
-        subprocess_worker can be invoked with -m mrmd_python.subprocess_worker.
+        the dedicated kernel process can be invoked with -m mrmd_python.kernel_process.
 
         Returns True if successful.
         """
@@ -814,12 +811,16 @@ class IPythonWorker:
             if exec_result.error_in_exec:
                 if isinstance(exec_result.error_in_exec, StdinNotAllowedError):
                     result.error = ExecuteError(type="StdinNotAllowed", message=str(exec_result.error_in_exec))
+                elif isinstance(exec_result.error_in_exec, InputCancelledError):
+                    result.error = ExecuteError(type="InputCancelled", message="Input cancelled by user")
                 else:
                     result.error = self._format_exception(exec_result.error_in_exec)
                 result.success = False
             elif exec_result.error_before_exec:
                 if isinstance(exec_result.error_before_exec, StdinNotAllowedError):
                     result.error = ExecuteError(type="StdinNotAllowed", message=str(exec_result.error_before_exec))
+                elif isinstance(exec_result.error_before_exec, InputCancelledError):
+                    result.error = ExecuteError(type="InputCancelled", message="Input cancelled by user")
                 else:
                     result.error = self._format_exception(exec_result.error_before_exec)
                 result.success = False
@@ -833,6 +834,9 @@ class IPythonWorker:
                         DisplayData(data=disp["data"], metadata=disp.get("metadata", {}))
                     )
 
+        except KeyboardInterrupt:
+            result.error = ExecuteError(type="KeyboardInterrupt", message="Interrupted")
+            result.success = False
         except StdinNotAllowedError as e:
             result.error = ExecuteError(type="StdinNotAllowed", message=str(e))
             result.success = False
@@ -1086,12 +1090,16 @@ class IPythonWorker:
             if exec_result.error_in_exec:
                 if isinstance(exec_result.error_in_exec, StdinNotAllowedError):
                     result.error = ExecuteError(type="StdinNotAllowed", message=str(exec_result.error_in_exec))
+                elif isinstance(exec_result.error_in_exec, InputCancelledError):
+                    result.error = ExecuteError(type="InputCancelled", message="Input cancelled by user")
                 else:
                     result.error = self._format_exception(exec_result.error_in_exec)
                 result.success = False
             elif exec_result.error_before_exec:
                 if isinstance(exec_result.error_before_exec, StdinNotAllowedError):
                     result.error = ExecuteError(type="StdinNotAllowed", message=str(exec_result.error_before_exec))
+                elif isinstance(exec_result.error_before_exec, InputCancelledError):
+                    result.error = ExecuteError(type="InputCancelled", message="Input cancelled by user")
                 else:
                     result.error = self._format_exception(exec_result.error_before_exec)
                 result.success = False
@@ -1170,6 +1178,9 @@ class IPythonWorker:
 
     def complete(self, code: str, cursor_pos: int) -> CompleteResult:
         """Get completions at cursor position."""
+        if self._should_use_subprocess():
+            return self._get_subprocess_worker().complete(code, cursor_pos)
+
         self._ensure_initialized()
 
         # Check if we're inside a function call — if so, inject
@@ -1727,6 +1738,9 @@ class IPythonWorker:
 
     def inspect(self, code: str, cursor_pos: int, detail: int = 1) -> InspectResult:
         """Get detailed info about symbol at cursor."""
+        if self._should_use_subprocess():
+            return self._get_subprocess_worker().inspect(code, cursor_pos, detail)
+
         self._ensure_initialized()
 
         try:
@@ -1789,6 +1803,9 @@ class IPythonWorker:
 
     def hover(self, code: str, cursor_pos: int) -> HoverResult:
         """Get hover tooltip for symbol."""
+        if self._should_use_subprocess():
+            return self._get_subprocess_worker().hover(code, cursor_pos)
+
         self._ensure_initialized()
 
         try:
@@ -1902,6 +1919,9 @@ class IPythonWorker:
 
     def get_variables(self) -> VariablesResult:
         """Get user variables with type info."""
+        if self._should_use_subprocess():
+            return self._get_subprocess_worker().get_variables()
+
         self._ensure_initialized()
 
         variables = []
@@ -1943,6 +1963,9 @@ class IPythonWorker:
         self, name: str, path: list[str] | None = None
     ) -> VariableDetail:
         """Get detailed info about a variable."""
+        if self._should_use_subprocess():
+            return self._get_subprocess_worker().get_variable_detail(name, path)
+
         self._ensure_initialized()
 
         try:
@@ -2037,6 +2060,9 @@ class IPythonWorker:
 
     def is_complete(self, code: str) -> IsCompleteResult:
         """Check if code is a complete statement."""
+        if self._should_use_subprocess():
+            return self._get_subprocess_worker().is_complete(code)
+
         self._ensure_initialized()
 
         try:
@@ -2047,6 +2073,9 @@ class IPythonWorker:
 
     def format_code(self, code: str) -> tuple[str, bool]:
         """Format code using black."""
+        if self._should_use_subprocess():
+            return self._get_subprocess_worker().format_code(code)
+
         try:
             import black
 
@@ -2125,6 +2154,10 @@ class IPythonWorker:
         if self._subprocess_worker is not None:
             self._subprocess_worker.shutdown()
             self._subprocess_worker = None
+
+    def supports_busy_introspection(self) -> bool:
+        """Whether this worker can safely answer best-effort introspection while busy."""
+        return self._should_use_subprocess()
 
     def interrupt(self) -> bool:
         """Interrupt currently running code.

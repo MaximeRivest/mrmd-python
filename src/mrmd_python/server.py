@@ -314,6 +314,17 @@ class RuntimeManager:
                 return True
         return False
 
+    def cancel_all_pending_inputs(self) -> bool:
+        """Cancel every pending input request.
+
+        There is normally at most one, but this is the safest way to ensure an
+        interrupt never leaves a streaming request blocked on stdin.
+        """
+        cancelled = False
+        for exec_id in list(self._pending_inputs.keys()):
+            cancelled = self.cancel_pending_input(exec_id) or cancelled
+        return cancelled
+
 
 class MRPServer:
     """MRP HTTP Server."""
@@ -654,70 +665,68 @@ class MRPServer:
         """POST /interrupt"""
         worker, _ = self.runtime_manager.get_or_create_runtime()
         try:
-            interrupted = worker.interrupt()
+            # If execution is blocked waiting for stdin, unblock the server-side
+            # future immediately so the streaming request can finish cleanly.
+            cancelled = self.runtime_manager.cancel_all_pending_inputs()
+            interrupted = worker.interrupt() or cancelled
             return JSONResponse({"interrupted": interrupted})
         except Exception as e:
             return JSONResponse({"interrupted": False, "error": str(e)})
 
     async def handle_complete(self, request: Request) -> JSONResponse:
         """POST /complete"""
-        if self.runtime_manager.is_busy():
-            return self._runtime_busy_response()
-
         body = await request.json()
         code = body.get("code", "")
         cursor = body.get("cursor", len(code))
         worker, _ = self.runtime_manager.get_or_create_runtime()
+        if self.runtime_manager.is_busy() and not worker.supports_busy_introspection():
+            return self._runtime_busy_response()
         loop = asyncio.get_event_loop()
         result = await loop.run_in_executor(None, lambda: worker.complete(code, cursor))
         return JSONResponse(_dataclass_to_dict(result))
 
     async def handle_inspect(self, request: Request) -> JSONResponse:
         """POST /inspect"""
-        if self.runtime_manager.is_busy():
-            return self._runtime_busy_response()
-
         body = await request.json()
         code = body.get("code", "")
         cursor = body.get("cursor", len(code))
         detail = body.get("detail", 1)
         worker, _ = self.runtime_manager.get_or_create_runtime()
+        if self.runtime_manager.is_busy() and not worker.supports_busy_introspection():
+            return self._runtime_busy_response()
         loop = asyncio.get_event_loop()
         result = await loop.run_in_executor(None, lambda: worker.inspect(code, cursor, detail))
         return JSONResponse(_dataclass_to_dict(result))
 
     async def handle_hover(self, request: Request) -> JSONResponse:
         """POST /hover"""
-        if self.runtime_manager.is_busy():
-            return self._runtime_busy_response()
-
         body = await request.json()
         code = body.get("code", "")
         cursor = body.get("cursor", len(code))
         worker, _ = self.runtime_manager.get_or_create_runtime()
+        if self.runtime_manager.is_busy() and not worker.supports_busy_introspection():
+            return self._runtime_busy_response()
         loop = asyncio.get_event_loop()
         result = await loop.run_in_executor(None, lambda: worker.hover(code, cursor))
         return JSONResponse(_dataclass_to_dict(result))
 
     async def handle_variables(self, request: Request) -> JSONResponse:
         """POST /variables"""
-        if self.runtime_manager.is_busy():
-            return self._runtime_busy_response()
-
         worker, _ = self.runtime_manager.get_or_create_runtime()
+        if self.runtime_manager.is_busy() and not worker.supports_busy_introspection():
+            return self._runtime_busy_response()
         loop = asyncio.get_event_loop()
         result = await loop.run_in_executor(None, worker.get_variables)
         return JSONResponse(_dataclass_to_dict(result))
 
     async def handle_variable_detail(self, request: Request) -> JSONResponse:
         """POST /variables/{name}"""
-        if self.runtime_manager.is_busy():
-            return self._runtime_busy_response()
-
         name = request.path_params["name"]
         body = await request.json()
         path = body.get("path")
         worker, _ = self.runtime_manager.get_or_create_runtime()
+        if self.runtime_manager.is_busy() and not worker.supports_busy_introspection():
+            return self._runtime_busy_response()
         loop = asyncio.get_event_loop()
         result = await loop.run_in_executor(None, lambda: worker.get_variable_detail(name, path))
         return JSONResponse(_dataclass_to_dict(result))
