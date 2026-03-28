@@ -97,6 +97,8 @@ py_look(code="math.sq", cursor=7)
 py_ctl(op="reset")                 # clear namespace
 py_ctl(op="reset", scope="all")   # clear everything
 py_ctl(op="cancel")               # cancel running execution
+py_ctl(op="restart")              # restart interpreter (fixes corrupted state)
+py_ctl(op="status")               # python idle | exec #5 | rev 17 | up 3600s
 ```
 
 ## Install
@@ -108,14 +110,37 @@ uv pip install mrmd-python
 ## Start
 
 ```bash
-mrmd-python                  # MCP over stdio (default)
-mrmd-python --http           # MCP over HTTP
-mrmd-python --cwd ~/project  # specific project directory
-mrmd-python --venv ~/p/.venv # specific virtual environment
+mrmd-python                  # MCP over stdio (for Claude Desktop, Cursor)
+mrmd-python start            # shared runtime server (background, multi-client)
+mrmd-python stop             # stop the shared runtime
+mrmd-python status           # show if running
 mrmd-python install          # show config for Claude Desktop / Cursor / mcp2cli
 ```
 
-Default is **stdio** — exactly what MCP hosts expect. Auto-detects venv from current directory.
+### Shared mode (recommended for collaboration)
+
+One runtime, many clients — terminal, LLM, and notebook all share the same namespace:
+
+```bash
+cd ~/my-project
+mrmd-python start
+# → Runtime started (pid 12345)
+# → MCP: http://127.0.0.1:8717/mcp-server/mcp
+# → mcp2cli registered and exposed as 'py'
+# → Try: py py "print('hello')"
+```
+
+Now from the terminal, Claude Desktop, Cursor, a notebook GUI — all connect to the same URL, all see the same variables.
+
+### Stdio mode (for single-client MCP hosts)
+
+Default when no subcommand — exactly what MCP hosts expect:
+
+```bash
+mrmd-python                  # stdio
+mrmd-python --cwd ~/project  # specific directory
+mrmd-python --venv ~/p/.venv # specific venv
+```
 
 ## Connect
 

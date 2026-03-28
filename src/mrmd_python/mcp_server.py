@@ -428,6 +428,8 @@ def create_mcp_server(
 
         op="reset": clear namespace (scope: "namespace", "history", "assets", or "all").
         op="cancel": cancel the active execution.
+        op="restart": restart interpreter (heavier than reset, fixes corrupted state).
+        op="status": show detailed runtime health.
         """
         if op == "reset":
             scopes = ["namespace", "history", "assets"] if scope == "all" else [scope]
@@ -445,7 +447,24 @@ def create_mcp_server(
                 return f"CANCELLED {eid}"
             except RuntimeError as e:
                 return f"ERROR: {e}"
-        return f"ERROR: unknown op '{op}'. Use 'reset' or 'cancel'."
+        elif op == "restart":
+            try:
+                service.shutdown()
+                service.reset(scope=["namespace", "history", "assets"])
+                return "RESTARTED | interpreter reinitialized | 0 vars"
+            except Exception as e:
+                return f"ERROR: {e}"
+        elif op == "status":
+            h = service.get_health()
+            parts = [f"python {h.get('state', '?')}",
+                     f"exec #{h.get('executionCount', 0)}",
+                     f"rev {h.get('stateRevision', 0)}",
+                     f"up {h.get('uptimeSeconds', 0)}s"]
+            eid = h.get("currentExecutionId")
+            if eid:
+                parts.append(f"running: {eid}")
+            return " | ".join(parts)
+        return f"ERROR: unknown op '{op}'. Use reset, cancel, restart, or status."
 
     return mcp
 
