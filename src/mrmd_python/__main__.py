@@ -22,19 +22,20 @@ from pathlib import Path
 # ── State file ───────────────────────────────────────────────────
 
 STATE_DIR = Path.home() / ".mrmd" / "runtimes"
-DEFAULT_PORT = 8717
+PORT_START = 8717
 
 
-def _state_file(cwd: str) -> Path:
-    """State file path for a given cwd."""
-    # Use a hash of cwd to allow multiple runtimes
-    import hashlib
-    h = hashlib.sha256(cwd.encode()).hexdigest()[:12]
-    return STATE_DIR / f"{h}.json"
+def _default_name(cwd: str) -> str:
+    """Default runtime name from directory."""
+    return Path(cwd).name or "default"
 
 
-def _read_state(cwd: str) -> dict | None:
-    f = _state_file(cwd)
+def _state_file(name: str) -> Path:
+    return STATE_DIR / f"{name}.json"
+
+
+def _read_state(name: str) -> dict | None:
+    f = _state_file(name)
     if f.exists():
         try:
             return json.loads(f.read_text())
@@ -43,15 +44,43 @@ def _read_state(cwd: str) -> dict | None:
     return None
 
 
-def _write_state(cwd: str, state: dict):
+def _write_state(name: str, state: dict):
     STATE_DIR.mkdir(parents=True, exist_ok=True)
-    _state_file(cwd).write_text(json.dumps(state, indent=2))
+    _state_file(name).write_text(json.dumps(state, indent=2))
 
 
-def _clear_state(cwd: str):
-    f = _state_file(cwd)
+def _clear_state(name: str):
+    f = _state_file(name)
     if f.exists():
         f.unlink()
+
+
+def _all_runtimes() -> list[dict]:
+    """List all registered runtimes."""
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    runtimes = []
+    for f in sorted(STATE_DIR.glob("*.json")):
+        try:
+            state = json.loads(f.read_text())
+            state["_name"] = f.stem
+            state["_alive"] = _is_alive(state.get("pid", 0))
+            runtimes.append(state)
+        except Exception:
+            pass
+    return runtimes
+
+
+def _find_free_port(start: int = PORT_START) -> int:
+    """Find a free port starting from start."""
+    import socket
+    for port in range(start, start + 100):
+        try:
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                s.bind(("127.0.0.1", port))
+                return port
+        except OSError:
+            continue
+    raise RuntimeError(f"No free port found in range {start}-{start+99}")
 
 
 def _is_alive(pid: int) -> bool:
@@ -85,58 +114,50 @@ def _find_venv(cwd: str | None = None) -> str | None:
 
 def _cmd_start(args):
     cwd = args.cwd or os.getcwd()
-    port = args.port or DEFAULT_PORT
+    name = args.name or _default_name(cwd)
     venv = args.venv or _find_venv(cwd)
 
     # Check if already running
-    state = _read_state(cwd)
+    state = _read_state(name)
     if state and _is_alive(state.get("pid", 0)):
-        url = state["url"]
-        print(f"Runtime already running (pid {state['pid']})")
-        print(f"  URL: {url}")
-        print(f"\nUse 'mrmd-python stop' to stop it first.")
+        print(f"Runtime '{name}' already running (pid {state['pid']})")
+        print(f"  MCP: {state['url']}")
+        print(f"\nUse 'mrmd-python stop {name}' to stop it first.")
         return
 
-    # Find python with mrmd-python installed
-    if venv:
-        python = os.path.join(venv, "bin", "python")
-    else:
-        python = sys.executable
+    # Find port
+    port = args.port or _find_free_port()
+
+    # Find python
+    python = os.path.join(venv, "bin", "python") if venv else sys.executable
 
     # Start server in background
     log_dir = Path.home() / ".mrmd" / "logs"
     log_dir.mkdir(parents=True, exist_ok=True)
-    log_file = log_dir / "runtime.log"
+    log_file = log_dir / f"{name}.log"
 
+    host = args.host or "127.0.0.1"
     cmd = [
         python, "-m", "mrmd_python",
-        "--http",
-        "--port", str(port),
-        "--host", args.host or "127.0.0.1",
-        "--cwd", cwd,
+        "--http", "--port", str(port), "--host", host, "--cwd", cwd,
     ]
     if venv:
         cmd.extend(["--venv", venv])
 
     with open(log_file, "w") as lf:
         proc = subprocess.Popen(
-            cmd,
-            start_new_session=True,
-            stdout=lf,
-            stderr=subprocess.STDOUT,
-            cwd=cwd,
+            cmd, start_new_session=True, stdout=lf, stderr=subprocess.STDOUT, cwd=cwd,
         )
 
-    # Wait for server to be ready
-    host = args.host or "127.0.0.1"
+    # Wait for ready
     url = f"http://{host}:{port}/mcp-server/mcp"
     health_url = f"http://{host}:{port}/health"
 
     ready = False
-    for _ in range(40):  # 4 seconds max
+    for _ in range(40):
         time.sleep(0.1)
         if not _is_alive(proc.pid):
-            print(f"ERROR: Server process died. Check {log_file}")
+            print(f"ERROR: Server died. Check {log_file}")
             return
         try:
             import urllib.request
@@ -156,65 +177,83 @@ def _cmd_start(args):
         return
 
     # Save state
-    _write_state(cwd, {
+    _write_state(name, {
         "pid": proc.pid,
         "port": port,
         "host": host,
         "url": url,
+        "name": name,
         "cwd": cwd,
         "venv": venv,
     })
 
-    print(f"Runtime started (pid {proc.pid})")
-    print(f"  MCP: {url}")
-    print(f"  cwd: {cwd}")
+    print(f"Runtime '{name}' started (pid {proc.pid})")
+    print(f"  MCP:  {url}")
+    print(f"  cwd:  {cwd}")
     if venv:
         print(f"  venv: {venv}")
-    print(f"  log: {log_file}")
+    print(f"  log:  {log_file}")
 
-    # Auto-register with mcp2cli if available
-    if shutil.which("mcp2cli"):
-        try:
-            subprocess.run(
-                ["mcp2cli", "rm", "python"],
-                capture_output=True, timeout=5,
-            )
-            subprocess.run(
-                ["mcp2cli", "add", "python", "--url", url],
-                capture_output=True, timeout=5,
-            )
-            # Try to expose
-            result = subprocess.run(
-                ["mcp2cli", "expose", "python", "--as", "py"],
-                capture_output=True, timeout=5, text=True,
-            )
-            if result.returncode == 0:
-                print(f"\n  mcp2cli registered and exposed as 'py'")
-                print(f"  Try: py py \"print('hello')\"")
-            else:
-                print(f"\n  mcp2cli registered as 'python'")
-                print(f"  Try: mcp2cli tool python py --code \"print('hello')\"")
-        except Exception:
-            pass
-    else:
-        print(f"\n  Connect: mcp2cli add python --url {url}")
+    # Auto-register with mcp2cli
+    _register_mcp2cli(name, url)
 
-    print(f"\n  Stop: mrmd-python stop")
+    print(f"\n  Stop: mrmd-python stop {name}")
+
+
+def _register_mcp2cli(name: str, url: str):
+    """Auto-register with mcp2cli if available."""
+    if not shutil.which("mcp2cli"):
+        print(f"\n  Connect: mcp2cli add {name} --url {url}")
+        return
+
+    cli_name = f"python-{name}" if name != "default" else "python"
+    try:
+        subprocess.run(["mcp2cli", "rm", cli_name], capture_output=True, timeout=5)
+        subprocess.run(["mcp2cli", "add", cli_name, "--url", url], capture_output=True, timeout=5)
+        result = subprocess.run(
+            ["mcp2cli", "expose", cli_name, "--as", cli_name],
+            capture_output=True, timeout=5, text=True,
+        )
+        if result.returncode == 0:
+            print(f"\n  mcp2cli: registered as '{cli_name}'")
+        else:
+            print(f"\n  mcp2cli: registered as '{cli_name}'")
+    except Exception:
+        pass
+
+
+def _unregister_mcp2cli(name: str):
+    """Remove from mcp2cli."""
+    if not shutil.which("mcp2cli"):
+        return
+    cli_name = f"python-{name}" if name != "default" else "python"
+    try:
+        subprocess.run(["mcp2cli", "unexpose", cli_name], capture_output=True, timeout=5)
+        subprocess.run(["mcp2cli", "rm", cli_name], capture_output=True, timeout=5)
+    except Exception:
+        pass
 
 
 def _cmd_stop(args):
     cwd = args.cwd or os.getcwd()
-    state = _read_state(cwd)
+    name = args.name or _default_name(cwd)
+    state = _read_state(name)
 
     if not state:
-        print("No runtime registered for this directory.")
+        print(f"No runtime '{name}' registered.")
+        # Show what IS running
+        all_rt = _all_runtimes()
+        alive = [r for r in all_rt if r["_alive"]]
+        if alive:
+            print(f"\nRunning runtimes:")
+            for r in alive:
+                print(f"  {r['_name']}: pid {r.get('pid')} port {r.get('port')} cwd {r.get('cwd', '?')}")
         return
 
     pid = state.get("pid", 0)
     if _is_alive(pid):
         try:
             os.kill(pid, signal.SIGTERM)
-            # Wait for graceful shutdown
             for _ in range(20):
                 if not _is_alive(pid):
                     break
@@ -224,52 +263,90 @@ def _cmd_stop(args):
         except Exception as e:
             print(f"Warning: {e}")
 
-    _clear_state(cwd)
-
-    # Clean up mcp2cli
-    if shutil.which("mcp2cli"):
-        try:
-            subprocess.run(["mcp2cli", "unexpose", "python"], capture_output=True, timeout=5)
-            subprocess.run(["mcp2cli", "rm", "python"], capture_output=True, timeout=5)
-        except Exception:
-            pass
-
-    print(f"Runtime stopped (was pid {pid})")
+    _clear_state(name)
+    _unregister_mcp2cli(name)
+    print(f"Runtime '{name}' stopped (was pid {pid})")
 
 
 def _cmd_status(args):
     cwd = args.cwd or os.getcwd()
-    state = _read_state(cwd)
+    name = args.name
 
-    if not state:
-        print("No runtime registered for this directory.")
+    if name:
+        # Show specific runtime
+        _show_runtime_status(name)
+        return
+
+    # Show all runtimes
+    all_rt = _all_runtimes()
+    if not all_rt:
+        print("No runtimes registered.")
         print(f"\nStart one: mrmd-python start")
         return
 
-    pid = state.get("pid", 0)
-    alive = _is_alive(pid)
+    # Clean up dead ones
+    alive = []
+    for r in all_rt:
+        if r["_alive"]:
+            alive.append(r)
+        else:
+            _clear_state(r["_name"])
 
-    if alive:
-        # Try to get health
-        health_info = ""
+    if not alive:
+        print("No runtimes running.")
+        print(f"\nStart one: mrmd-python start")
+        return
+
+    # Table header
+    nw = max(len(r["_name"]) for r in alive)
+    nw = max(nw, 4)
+    print(f"{'NAME':<{nw}}  {'PID':<7}  {'PORT':<5}  {'STATE':<8}  {'EXECS':<5}  CWD")
+
+    for r in alive:
+        # Get health
+        state_str = "?"
+        execs = "?"
         try:
             import urllib.request
-            url = state["url"].replace("/mcp-server/mcp", "/health")
-            with urllib.request.urlopen(url, timeout=2) as r:
-                h = json.loads(r.read())
-                health_info = f" | {h.get('state', '?')} | {h.get('executionCount', 0)} execs | rev {h.get('stateRevision', 0)}"
+            health_url = f"http://{r.get('host', '127.0.0.1')}:{r.get('port')}/health"
+            with urllib.request.urlopen(health_url, timeout=1) as resp:
+                h = json.loads(resp.read())
+                state_str = h.get("state", "?")
+                execs = str(h.get("executionCount", 0))
         except Exception:
             pass
 
-        print(f"RUNNING (pid {pid}){health_info}")
-        print(f"  MCP: {state.get('url')}")
-        print(f"  cwd: {state.get('cwd')}")
-        if state.get("venv"):
-            print(f"  venv: {state['venv']}")
-    else:
-        _clear_state(cwd)
-        print(f"DEAD (was pid {pid}, cleaned up)")
-        print(f"\nRestart: mrmd-python start")
+        print(f"{r['_name']:<{nw}}  {r.get('pid', '?'):<7}  {r.get('port', '?'):<5}  {state_str:<8}  {execs:<5}  {r.get('cwd', '?')}")
+
+
+def _show_runtime_status(name: str):
+    state = _read_state(name)
+    if not state:
+        print(f"No runtime '{name}' registered.")
+        return
+
+    pid = state.get("pid", 0)
+    if not _is_alive(pid):
+        _clear_state(name)
+        print(f"Runtime '{name}' is DEAD (was pid {pid}, cleaned up)")
+        print(f"\nRestart: mrmd-python start --name {name}")
+        return
+
+    health_info = ""
+    try:
+        import urllib.request
+        health_url = f"http://{state.get('host', '127.0.0.1')}:{state.get('port')}/health"
+        with urllib.request.urlopen(health_url, timeout=2) as r:
+            h = json.loads(r.read())
+            health_info = f" | {h.get('state', '?')} | {h.get('executionCount', 0)} execs | rev {h.get('stateRevision', 0)}"
+    except Exception:
+        pass
+
+    print(f"Runtime '{name}' RUNNING (pid {pid}){health_info}")
+    print(f"  MCP:  {state.get('url')}")
+    print(f"  cwd:  {state.get('cwd')}")
+    if state.get("venv"):
+        print(f"  venv: {state['venv']}")
 
 
 def _cmd_install(args):
@@ -335,8 +412,9 @@ def main():
         choices=[None, "start", "stop", "status", "install"],
         help="Subcommand",
     )
+    parser.add_argument("--name", default=None, help="Runtime name (default: directory name)")
     parser.add_argument("--http", action="store_true", help="HTTP mode (foreground)")
-    parser.add_argument("--port", type=int, default=None, help=f"HTTP port (default: {DEFAULT_PORT})")
+    parser.add_argument("--port", type=int, default=None, help="HTTP port (default: auto)")
     parser.add_argument("--host", default=None, help="HTTP host (default: 127.0.0.1)")
     parser.add_argument("--cwd", default=None, help="Working directory (default: current)")
     parser.add_argument("--venv", default=None, help="Virtual environment (default: auto-detect)")
