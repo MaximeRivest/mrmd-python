@@ -147,6 +147,7 @@ class SubprocessWorker:
         code: str,
         store_history: bool = True,
         exec_id: str | None = None,
+        allow_stdin: bool = False,
     ) -> ExecuteResult:
         """Execute code in the subprocess."""
         response = self._send_command({
@@ -154,6 +155,7 @@ class SubprocessWorker:
             "code": code,
             "storeHistory": store_history,
             "execId": exec_id,
+            "allowStdin": allow_stdin,
         })
 
         if response.get("type") == "error":
@@ -176,55 +178,68 @@ class SubprocessWorker:
         store_history: bool = True,
         exec_id: str | None = None,
         on_stdin_request: Callable | None = None,
+        allow_stdin: bool = True,
+        on_event: Callable[[str, dict], None] | None = None,
     ) -> ExecuteResult:
         """
         Execute code with streaming output.
 
-        For the subprocess worker, we handle streaming by reading stderr
-        in a background thread while the execution runs.
+        For subprocess runtimes we use a line-oriented JSON event stream over
+        stdout, ending with a final `result` or `error` message.
         """
         self._ensure_started()
 
-        # For subprocess streaming, we'll use a simpler approach:
-        # Send execute command and poll for output
         with self._lock:
             self._process.stdin.write(json.dumps({
-                "type": "execute",
+                "type": "execute_stream",
                 "code": code,
                 "storeHistory": store_history,
                 "execId": exec_id,
-            }) + "\n")
+                "allowStdin": allow_stdin,
+            }) + "
+")
             self._process.stdin.flush()
 
             accumulated_stdout = ""
             accumulated_stderr = ""
 
-            # Read the response (the subprocess will have captured all output)
-            response_line = self._process.stdout.readline()
-            if not response_line:
-                raise RuntimeError("Subprocess closed unexpectedly")
+            while True:
+                response_line = self._process.stdout.readline()
+                if not response_line:
+                    raise RuntimeError("Subprocess closed unexpectedly")
 
-            response = json.loads(response_line)
+                response = json.loads(response_line)
+                response_type = response.get("type")
 
-        if response.get("type") == "error":
-            return ExecuteResult(
-                success=False,
-                error=ExecuteError(
-                    type="SubprocessError",
-                    message=response.get("error", "Unknown error"),
-                ),
-            )
+                if response_type == "event":
+                    event_type = response.get("event")
+                    event_data = response.get("data", {})
+                    if event_type in ("stdout", "stderr"):
+                        content = event_data.get("content", "")
+                        if event_type == "stdout":
+                            accumulated_stdout += content
+                            on_output("stdout", content, accumulated_stdout)
+                        else:
+                            accumulated_stderr += content
+                            on_output("stderr", content, accumulated_stderr)
+                    elif on_event and event_type:
+                        on_event(event_type, event_data)
+                    continue
 
-        result_data = response.get("result", {})
-        result = self._parse_execute_result(result_data)
+                if response_type == "error":
+                    return ExecuteResult(
+                        success=False,
+                        error=ExecuteError(
+                            type="SubprocessError",
+                            message=response.get("error", "Unknown error"),
+                            traceback=response.get("traceback", "").split("
+") if response.get("traceback") else [],
+                        ),
+                    )
 
-        # Send final output via callback
-        if result.stdout:
-            on_output("stdout", result.stdout, result.stdout)
-        if result.stderr:
-            on_output("stderr", result.stderr, result.stderr)
-
-        return result
+                if response_type == "result":
+                    result_data = response.get("result", {})
+                    return self._parse_execute_result(result_data)
 
     def complete(self, code: str, cursor_pos: int) -> CompleteResult:
         """Get completions at cursor position."""
@@ -325,6 +340,7 @@ class SubprocessWorker:
             variables=variables,
             count=result.get("count", len(variables)),
             truncated=result.get("truncated", False),
+            warnings=result.get("warnings", []),
         )
 
     def get_variable_detail(self, name: str, path: list[str] | None = None) -> VariableDetail:
@@ -396,6 +412,11 @@ class SubprocessWorker:
     def reset(self):
         """Reset the namespace."""
         self._send_command({"type": "reset"})
+
+    def clear_history(self) -> bool:
+        """Clear execution history."""
+        response = self._send_command({"type": "clear_history"})
+        return response.get("success", False)
 
     def get_info(self) -> dict:
         """Get info about this worker."""
@@ -483,7 +504,7 @@ class SubprocessWorker:
         assets = []
         for a in data.get("assets", []):
             assets.append(Asset(
-                path=a.get("path", ""),
+                id=a.get("id", ""),
                 url=a.get("url", ""),
                 mimeType=a.get("mimeType", ""),
                 assetType=a.get("assetType", ""),
@@ -506,7 +527,9 @@ class SubprocessWorker:
             displayData=display_data,
             assets=assets,
             executionCount=data.get("executionCount", 0),
+            stateRevision=data.get("stateRevision", 0),
             duration=data.get("duration"),
+            warnings=data.get("warnings", []),
         )
 
     def __del__(self):

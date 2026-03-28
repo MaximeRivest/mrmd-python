@@ -24,6 +24,7 @@ import os
 import asyncio
 import uuid
 import threading
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -35,6 +36,7 @@ from starlette.responses import JSONResponse, Response, FileResponse
 from starlette.middleware import Middleware
 from starlette.middleware.cors import CORSMiddleware
 from sse_starlette.sse import EventSourceResponse
+from sse_starlette.event import ServerSentEvent
 
 from .runtime_client import DaemonRuntimeClient
 from .worker import IPythonWorker
@@ -48,7 +50,9 @@ from .types import (
     CapabilityFeatures,
     Environment,
     ExecuteResult,
+    ExecuteError,
     InputCancelledError,
+    StdinNotAllowedError,
 )
 
 
@@ -71,6 +75,7 @@ class RuntimeManager:
     Runtime model:
     - one server process = one REPL namespace
     - no per-request or per-document MRP sessions
+    - at most one active execution at a time
     """
 
     def __init__(
@@ -88,6 +93,10 @@ class RuntimeManager:
         self.worker: IPythonWorker | DaemonRuntimeClient | None = None
         self._pending_inputs: dict[str, asyncio.Future] = {}
         self._lock = threading.Lock()
+        self._started_at = time.time()
+        self._state_revision = 0
+        self._state = "idle"
+        self._current_exec_id: str | None = None
 
     def get_or_create_runtime(
         self,
@@ -158,16 +167,106 @@ class RuntimeManager:
         """Get runtime info if initialized."""
         return self.runtime
 
-    def reset_runtime(self) -> bool:
-        """Reset runtime state (clear namespace)."""
-        if not self.worker or not self.runtime:
+    def get_health(self) -> dict:
+        runtime_name = "mrmd-python"
+        execution_count = self.runtime["executionCount"] if self.runtime else 0
+        return {
+            "status": "ok",
+            "state": self._state,
+            "runtime": runtime_name,
+            "currentExecId": self._current_exec_id,
+            "executionCount": execution_count,
+            "stateRevision": self._state_revision,
+            "uptime": int(time.time() - self._started_at),
+        }
+
+    def try_begin_execution(self, exec_id: str) -> tuple[bool, str | None]:
+        """Try to start an execution, returning (started, currentExecId)."""
+        with self._lock:
+            if self._current_exec_id is not None:
+                return False, self._current_exec_id
+            self._current_exec_id = exec_id
+            self._state = "executing"
+            if self.runtime is not None:
+                self.runtime["lastActivity"] = datetime.now(timezone.utc).isoformat()
+            return True, None
+
+    def finish_execution(self) -> int:
+        """Mark the active execution as complete and bump state revision."""
+        with self._lock:
+            self._current_exec_id = None
+            self._state = "idle"
+            self._state_revision += 1
+            if self.runtime is not None:
+                self.runtime["lastActivity"] = datetime.now(timezone.utc).isoformat()
+            return self._state_revision
+
+    def mark_waiting_input(self, waiting: bool):
+        """Update runtime state while waiting for stdin."""
+        with self._lock:
+            if self._current_exec_id is None:
+                self._state = "idle"
+            else:
+                self._state = "waiting_input" if waiting else "executing"
+            if self.runtime is not None:
+                self.runtime["lastActivity"] = datetime.now(timezone.utc).isoformat()
+
+    def is_busy(self) -> bool:
+        with self._lock:
+            return self._current_exec_id is not None
+
+    def clear_assets(self) -> bool:
+        """Delete all saved assets."""
+        if not self.assets_dir:
             return False
-        if hasattr(self.worker, 'reset'):
-            self.worker.reset()
-        self.runtime["executionCount"] = 0
-        self.runtime["variableCount"] = 0
-        self.runtime["lastActivity"] = datetime.now(timezone.utc).isoformat()
+        assets_path = Path(self.assets_dir)
+        if not assets_path.exists():
+            return True
+        for child in assets_path.iterdir():
+            try:
+                if child.is_file():
+                    child.unlink()
+            except Exception:
+                pass
         return True
+
+    def reset_runtime(self, scope: list[str] | None = None) -> dict:
+        """Reset runtime state according to requested scope."""
+        scope = scope or ["namespace"]
+        cleared: list[str] = []
+
+        needs_worker = any(item in scope for item in ("namespace", "history"))
+        worker = None
+        if needs_worker:
+            worker, runtime = self.get_or_create_runtime()
+        else:
+            runtime = self.runtime
+
+        if "namespace" in scope and worker is not None and hasattr(worker, "reset"):
+            worker.reset()
+            cleared.append("namespace")
+
+        if "history" in scope and worker is not None and hasattr(worker, "clear_history"):
+            if worker.clear_history():
+                cleared.append("history")
+
+        if "assets" in scope and self.clear_assets():
+            cleared.append("assets")
+
+        with self._lock:
+            self._state_revision += 1
+            if runtime is not None:
+                runtime["lastActivity"] = datetime.now(timezone.utc).isoformat()
+                execution_count = runtime.get("executionCount", 0)
+            else:
+                execution_count = 0
+
+        return {
+            "reset": True,
+            "cleared": cleared,
+            "stateRevision": self._state_revision,
+            "executionCount": execution_count,
+        }
 
     def shutdown(self) -> bool:
         """Shutdown runtime worker and clear metadata."""
@@ -181,12 +280,15 @@ class RuntimeManager:
                 worker.reset()
             self.worker = None
             self.runtime = None
+            self._state = "idle"
+            self._current_exec_id = None
             return True
 
     def register_pending_input(self, exec_id: str, loop: asyncio.AbstractEventLoop) -> asyncio.Future:
         """Register that an execution is waiting for input."""
         future = loop.create_future()
         self._pending_inputs[exec_id] = future
+        self.mark_waiting_input(True)
         return future
 
     def provide_input(self, exec_id: str, text: str) -> bool:
@@ -195,6 +297,7 @@ class RuntimeManager:
             future = self._pending_inputs.pop(exec_id)
             if not future.done():
                 future.get_loop().call_soon_threadsafe(future.set_result, text)
+                self.mark_waiting_input(False)
                 return True
         return False
 
@@ -207,6 +310,7 @@ class RuntimeManager:
                     future.set_exception,
                     InputCancelledError("Input cancelled by user")
                 )
+                self.mark_waiting_input(False)
                 return True
         return False
 
@@ -236,7 +340,7 @@ class MRPServer:
         """Get server capabilities."""
         return Capabilities(
             runtime="mrmd-python",
-            version="0.1.0",
+            version="0.3.0",
             languages=["python", "py", "python3"],
             features=CapabilityFeatures(
                 execute=True,
@@ -264,6 +368,30 @@ class MRPServer:
     # Route Handlers
     # =========================================================================
 
+    def _execution_in_progress_response(self, current_exec_id: str) -> JSONResponse:
+        return JSONResponse(
+            {
+                "error": "execution_in_progress",
+                "message": "An execution is already running. Use /interrupt to cancel it.",
+                "execId": current_exec_id,
+            },
+            status_code=409,
+        )
+
+    def _runtime_busy_response(self) -> JSONResponse:
+        return JSONResponse(
+            {
+                "error": "runtime_busy",
+                "message": "Runtime is executing code. Try again shortly.",
+            },
+            status_code=503,
+            headers={"Retry-After": "1"},
+        )
+
+    async def handle_health(self, request: Request) -> JSONResponse:
+        """GET /health"""
+        return JSONResponse(self.runtime_manager.get_health())
+
     async def handle_capabilities(self, request: Request) -> JSONResponse:
         """GET /capabilities"""
         caps = self.get_capabilities()
@@ -271,174 +399,242 @@ class MRPServer:
 
     async def handle_reset_runtime(self, request: Request) -> JSONResponse:
         """POST /reset"""
-        worker, runtime = self.runtime_manager.get_or_create_runtime()
-        worker.reset()
-        runtime["executionCount"] = 0
-        runtime["variableCount"] = 0
-        return JSONResponse({"success": True})
+        if self.runtime_manager.is_busy():
+            return self._execution_in_progress_response(self.runtime_manager.get_health()["currentExecId"] or "")
+
+        body = await request.json() if request.method == "POST" else {}
+        scope = body.get("scope", ["namespace"])
+        if not isinstance(scope, list):
+            scope = ["namespace"]
+        return JSONResponse(self.runtime_manager.reset_runtime(scope))
 
     async def handle_execute(self, request: Request) -> JSONResponse:
         """POST /execute"""
         body = await request.json()
         code = body.get("code", "")
         store_history = body.get("storeHistory", True)
+        allow_stdin = body.get("allowStdin", False)
         exec_id = body.get("execId", str(uuid.uuid4())[:8])
 
-        worker, runtime = self.runtime_manager.get_or_create_runtime()
+        if allow_stdin:
+            return JSONResponse(
+                {
+                    "error": "invalid_request",
+                    "message": "stdin is only supported with /execute/stream",
+                },
+                status_code=400,
+            )
 
-        # Run in thread pool to not block
-        loop = asyncio.get_event_loop()
-        result = await loop.run_in_executor(
-            None, lambda: worker.execute(code, store_history, exec_id)
-        )
+        started, current_exec_id = self.runtime_manager.try_begin_execution(exec_id)
+        if not started:
+            return self._execution_in_progress_response(current_exec_id or "")
 
-        runtime["executionCount"] = result.executionCount
-        runtime["variableCount"] = len(worker.get_variables().variables)
+        try:
+            worker, runtime = self.runtime_manager.get_or_create_runtime()
+            loop = asyncio.get_event_loop()
+            result = await loop.run_in_executor(
+                None, lambda: worker.execute(code, store_history, exec_id, False)
+            )
+            runtime["executionCount"] = result.executionCount
+            try:
+                runtime["variableCount"] = len(worker.get_variables().variables)
+            except Exception:
+                pass
+            result.stateRevision = self.runtime_manager.finish_execution()
+            return JSONResponse(_dataclass_to_dict(result))
+        except Exception as e:
+            revision = self.runtime_manager.finish_execution()
+            result = ExecuteResult(
+                success=False,
+                error=ExecuteError(type=type(e).__name__, message=str(e), traceback=[]),
+                stateRevision=revision,
+            )
+            return JSONResponse(_dataclass_to_dict(result))
 
-        return JSONResponse(_dataclass_to_dict(result))
-
-    async def handle_execute_stream(self, request: Request) -> EventSourceResponse:
+    async def handle_execute_stream(self, request: Request) -> Response:
         """POST /execute/stream - SSE streaming execution"""
         body = await request.json()
         code = body.get("code", "")
         store_history = body.get("storeHistory", True)
+        allow_stdin = body.get("allowStdin", True)
         exec_id = body.get("execId", str(uuid.uuid4())[:8])
 
-        worker, runtime = self.runtime_manager.get_or_create_runtime()
+        started, current_exec_id = self.runtime_manager.try_begin_execution(exec_id)
+        if not started:
+            return self._execution_in_progress_response(current_exec_id or "")
+
+        try:
+            worker, runtime = self.runtime_manager.get_or_create_runtime()
+        except Exception as e:
+            self.runtime_manager.finish_execution()
+            return JSONResponse(
+                {
+                    "error": "internal",
+                    "message": str(e),
+                },
+                status_code=500,
+            )
 
         async def event_generator():
-            # Capture the event loop for use in background threads
             loop = asyncio.get_running_loop()
+            output_queue: asyncio.Queue = asyncio.Queue()
+            result_holder = [None]
+            seq = 0
 
-            # Send start event
+            def next_seq() -> int:
+                nonlocal seq
+                seq += 1
+                return seq
+
             yield {
                 "event": "start",
                 "data": json.dumps({
                     "execId": exec_id,
+                    "seq": next_seq(),
                     "timestamp": datetime.now(timezone.utc).isoformat(),
                 }),
             }
 
-            # Queue for output from the worker thread
-            output_queue: asyncio.Queue = asyncio.Queue()
-            result_holder = [None]
-            accumulated = {"stdout": "", "stderr": ""}
-
             def on_output(stream: str, content: str, acc: str):
-                """Called from worker thread for each output chunk."""
-                accumulated[stream] = acc
                 asyncio.run_coroutine_threadsafe(
                     output_queue.put({
                         "event": stream,
-                        "data": {"content": content, "accumulated": acc},
-                    }),
-                    loop,  # Use captured loop
-                )
-
-            def on_stdin_request(request):
-                """Called from worker thread when input() is called.
-
-                This function blocks until input is provided via POST /input.
-                """
-                from .types import StdinRequest
-
-                # Send stdin_request event to client
-                asyncio.run_coroutine_threadsafe(
-                    output_queue.put({
-                        "event": "stdin_request",
-                        "data": {
-                            "prompt": request.prompt,
-                            "password": request.password,
-                            "execId": request.execId,
-                        },
+                        "data": {"seq": next_seq(), "content": content},
                     }),
                     loop,
                 )
 
-                # Register that we're waiting for input and get a future
+            def on_stdin_request(stdin_request):
+                asyncio.run_coroutine_threadsafe(
+                    output_queue.put({
+                        "event": "stdin_request",
+                        "data": {
+                            "seq": next_seq(),
+                            "prompt": stdin_request.prompt,
+                            "password": stdin_request.password,
+                            "execId": stdin_request.execId,
+                        },
+                    }),
+                    loop,
+                )
                 future = self.runtime_manager.register_pending_input(exec_id, loop)
 
-                # Wait for the input (blocking - we're in a worker thread)
-                # Use run_coroutine_threadsafe to wait on the future from this thread
                 async def wait_for_input():
                     return await future
 
                 concurrent_future = asyncio.run_coroutine_threadsafe(wait_for_input(), loop)
-
                 try:
-                    # Wait up to 5 minutes for input
-                    response = concurrent_future.result(timeout=300)
-                    return response
+                    return concurrent_future.result(timeout=300)
                 except InputCancelledError:
-                    # Re-raise InputCancelledError so the worker can handle it
                     raise
                 except Exception as e:
                     raise RuntimeError(f"Failed to get input: {e}")
+                finally:
+                    self.runtime_manager.mark_waiting_input(False)
 
             def run_execution():
-                """Run execution in thread."""
                 try:
                     result = worker.execute_streaming(
-                        code, on_output, store_history, exec_id,
-                        on_stdin_request=on_stdin_request
+                        code,
+                        on_output,
+                        store_history,
+                        exec_id,
+                        on_stdin_request=on_stdin_request if allow_stdin else None,
+                        allow_stdin=allow_stdin,
                     )
                     result_holder[0] = result
                 except Exception as e:
-                    result_holder[0] = ExecuteResult(
-                        success=False,
-                        error=worker._format_exception(e),
-                    )
+                    if hasattr(worker, "_format_exception"):
+                        error = worker._format_exception(e)
+                    else:
+                        error = ExecuteError(type=type(e).__name__, message=str(e), traceback=[])
+                    result_holder[0] = ExecuteResult(success=False, error=error)
                 finally:
-                    asyncio.run_coroutine_threadsafe(
-                        output_queue.put(None),  # Signal completion
-                        loop,  # Use captured loop
-                    )
+                    asyncio.run_coroutine_threadsafe(output_queue.put(None), loop)
 
-            # Start execution in background thread
             exec_thread = threading.Thread(target=run_execution, daemon=True)
             exec_thread.start()
 
-            # Stream output events
             while True:
-                try:
-                    item = await asyncio.wait_for(output_queue.get(), timeout=60.0)
-                    if item is None:
-                        break
-                    yield {
-                        "event": item["event"],
-                        "data": json.dumps(item["data"]),
-                    }
-                except asyncio.TimeoutError:
-                    # Keep connection alive
-                    yield {"event": "ping", "data": "{}"}
+                item = await output_queue.get()
+                if item is None:
+                    break
+                yield {
+                    "event": item["event"],
+                    "data": json.dumps(item["data"]),
+                }
 
-            # Wait for thread to finish
             exec_thread.join(timeout=5.0)
 
             result = result_holder[0]
+            state_revision = self.runtime_manager.finish_execution()
             if result:
                 runtime["executionCount"] = result.executionCount
-                runtime["variableCount"] = len(worker.get_variables().variables)
+                try:
+                    runtime["variableCount"] = len(worker.get_variables().variables)
+                except Exception:
+                    pass
+                result.stateRevision = state_revision
+
+                for display in result.displayData:
+                    yield {
+                        "event": "display",
+                        "data": json.dumps({
+                            "seq": next_seq(),
+                            "data": display.data,
+                            "metadata": display.metadata,
+                        }),
+                    }
+
+                for asset in result.assets:
+                    yield {
+                        "event": "asset",
+                        "data": json.dumps({
+                            "seq": next_seq(),
+                            **_dataclass_to_dict(asset),
+                        }),
+                    }
+
+                for warning in result.warnings:
+                    yield {
+                        "event": "warning",
+                        "data": json.dumps({"seq": next_seq(), **warning}),
+                    }
 
                 if result.success:
                     yield {
                         "event": "result",
-                        "data": json.dumps(_dataclass_to_dict(result)),
+                        "data": json.dumps({
+                            "seq": next_seq(),
+                            **_dataclass_to_dict(result),
+                        }),
                     }
                 else:
+                    error_payload = _dataclass_to_dict(result.error) if result.error else {}
+                    error_payload.update({
+                        "seq": next_seq(),
+                        "stateRevision": state_revision,
+                        "executionCount": result.executionCount,
+                        "duration": result.duration,
+                        "warnings": result.warnings,
+                    })
                     yield {
                         "event": "error",
-                        "data": json.dumps(_dataclass_to_dict(result.error) if result.error else {}),
+                        "data": json.dumps(error_payload),
                     }
 
-            yield {"event": "done", "data": "{}"}
+            yield {"event": "done", "data": json.dumps({"seq": next_seq()})}
 
-        return EventSourceResponse(event_generator())
+        return EventSourceResponse(
+            event_generator(),
+            ping=15,
+            ping_message_factory=lambda: ServerSentEvent(comment="keepalive"),
+        )
 
     async def handle_input(self, request: Request) -> JSONResponse:
         """POST /input - Send user input to waiting execution"""
         body = await request.json()
-        exec_id = body.get("exec_id", "")
+        exec_id = body.get("execId") or body.get("exec_id", "")
         text = body.get("text", "")
 
         if self.runtime_manager.provide_input(exec_id, text):
@@ -446,27 +642,17 @@ class MRPServer:
         return JSONResponse({"accepted": False, "error": "No pending input request"})
 
     async def handle_input_cancel(self, request: Request) -> JSONResponse:
-        """POST /input/cancel - Cancel pending input request
-
-        Called when the user dismisses the input field without providing input.
-        This unblocks the waiting execution and marks it as cancelled.
-        """
+        """POST /input/cancel - Cancel pending input request"""
         body = await request.json()
-        exec_id = body.get("exec_id", "")
+        exec_id = body.get("execId") or body.get("exec_id", "")
 
         if self.runtime_manager.cancel_pending_input(exec_id):
             return JSONResponse({"cancelled": True})
         return JSONResponse({"cancelled": False, "error": "No pending input request"})
 
     async def handle_interrupt(self, request: Request) -> JSONResponse:
-        """POST /interrupt
-
-        Interrupt currently running code in the runtime.
-        Sends SIGINT to subprocess workers or sets interrupt flag for local workers.
-        """
+        """POST /interrupt"""
         worker, _ = self.runtime_manager.get_or_create_runtime()
-
-        # Call interrupt on the worker
         try:
             interrupted = worker.interrupt()
             return JSONResponse({"interrupted": interrupted})
@@ -475,102 +661,83 @@ class MRPServer:
 
     async def handle_complete(self, request: Request) -> JSONResponse:
         """POST /complete"""
+        if self.runtime_manager.is_busy():
+            return self._runtime_busy_response()
+
         body = await request.json()
         code = body.get("code", "")
         cursor = body.get("cursor", len(code))
-
         worker, _ = self.runtime_manager.get_or_create_runtime()
-
         loop = asyncio.get_event_loop()
-        result = await loop.run_in_executor(
-            None, lambda: worker.complete(code, cursor)
-        )
-
+        result = await loop.run_in_executor(None, lambda: worker.complete(code, cursor))
         return JSONResponse(_dataclass_to_dict(result))
 
     async def handle_inspect(self, request: Request) -> JSONResponse:
         """POST /inspect"""
+        if self.runtime_manager.is_busy():
+            return self._runtime_busy_response()
+
         body = await request.json()
         code = body.get("code", "")
         cursor = body.get("cursor", len(code))
         detail = body.get("detail", 1)
-
         worker, _ = self.runtime_manager.get_or_create_runtime()
-
         loop = asyncio.get_event_loop()
-        result = await loop.run_in_executor(
-            None, lambda: worker.inspect(code, cursor, detail)
-        )
-
+        result = await loop.run_in_executor(None, lambda: worker.inspect(code, cursor, detail))
         return JSONResponse(_dataclass_to_dict(result))
 
     async def handle_hover(self, request: Request) -> JSONResponse:
         """POST /hover"""
+        if self.runtime_manager.is_busy():
+            return self._runtime_busy_response()
+
         body = await request.json()
         code = body.get("code", "")
         cursor = body.get("cursor", len(code))
-
         worker, _ = self.runtime_manager.get_or_create_runtime()
-
         loop = asyncio.get_event_loop()
-        result = await loop.run_in_executor(
-            None, lambda: worker.hover(code, cursor)
-        )
-
+        result = await loop.run_in_executor(None, lambda: worker.hover(code, cursor))
         return JSONResponse(_dataclass_to_dict(result))
 
     async def handle_variables(self, request: Request) -> JSONResponse:
         """POST /variables"""
-        body = await request.json()
+        if self.runtime_manager.is_busy():
+            return self._runtime_busy_response()
 
         worker, _ = self.runtime_manager.get_or_create_runtime()
-
         loop = asyncio.get_event_loop()
         result = await loop.run_in_executor(None, worker.get_variables)
-
         return JSONResponse(_dataclass_to_dict(result))
 
     async def handle_variable_detail(self, request: Request) -> JSONResponse:
         """POST /variables/{name}"""
+        if self.runtime_manager.is_busy():
+            return self._runtime_busy_response()
+
         name = request.path_params["name"]
         body = await request.json()
         path = body.get("path")
-
         worker, _ = self.runtime_manager.get_or_create_runtime()
-
         loop = asyncio.get_event_loop()
-        result = await loop.run_in_executor(
-            None, lambda: worker.get_variable_detail(name, path)
-        )
-
+        result = await loop.run_in_executor(None, lambda: worker.get_variable_detail(name, path))
         return JSONResponse(_dataclass_to_dict(result))
 
     async def handle_is_complete(self, request: Request) -> JSONResponse:
         """POST /is_complete"""
         body = await request.json()
         code = body.get("code", "")
-
         worker, _ = self.runtime_manager.get_or_create_runtime()
-
         loop = asyncio.get_event_loop()
-        result = await loop.run_in_executor(
-            None, lambda: worker.is_complete(code)
-        )
-
+        result = await loop.run_in_executor(None, lambda: worker.is_complete(code))
         return JSONResponse(_dataclass_to_dict(result))
 
     async def handle_format(self, request: Request) -> JSONResponse:
         """POST /format"""
         body = await request.json()
         code = body.get("code", "")
-
         worker, _ = self.runtime_manager.get_or_create_runtime()
-
         loop = asyncio.get_event_loop()
-        formatted, changed = await loop.run_in_executor(
-            None, lambda: worker.format_code(code)
-        )
-
+        formatted, changed = await loop.run_in_executor(None, lambda: worker.format_code(code))
         return JSONResponse({"formatted": formatted, "changed": changed})
 
     async def handle_history(self, request: Request) -> JSONResponse:
@@ -579,25 +746,23 @@ class MRPServer:
         n = body.get("n", 20)
         pattern = body.get("pattern")
         before = body.get("before")
-
         worker, _ = self.runtime_manager.get_or_create_runtime()
-
         loop = asyncio.get_event_loop()
         result = await loop.run_in_executor(
             None, lambda: worker.get_history(n=n, pattern=pattern, before=before)
         )
-
         return JSONResponse(_dataclass_to_dict(result))
 
     async def handle_asset(self, request: Request) -> Response:
-        """GET /assets/{path}"""
-        asset_path = request.path_params["path"]
-        full_path = Path(self.assets_dir) / asset_path
+        """GET /assets/{id}"""
+        asset_id = request.path_params["id"]
+        if "/" in asset_id or ".." in asset_id:
+            return JSONResponse({"error": "not_found", "message": "Asset not found"}, status_code=404)
 
-        if not full_path.exists():
-            return JSONResponse({"error": "Asset not found"}, status_code=404)
+        full_path = Path(self.assets_dir) / asset_id
+        if not full_path.exists() or not full_path.is_file():
+            return JSONResponse({"error": "not_found", "message": "Asset not found"}, status_code=404)
 
-        # Determine content type
         suffix = full_path.suffix.lower()
         content_types = {
             ".png": "image/png",
@@ -608,12 +773,12 @@ class MRPServer:
             ".json": "application/json",
         }
         content_type = content_types.get(suffix, "application/octet-stream")
-
         return FileResponse(full_path, media_type=content_type)
 
     def create_routes(self) -> list[Route]:
         """Create all routes."""
         return [
+            Route("/mrp/v1/health", self.handle_health, methods=["GET"]),
             Route("/mrp/v1/capabilities", self.handle_capabilities, methods=["GET"]),
             Route("/mrp/v1/reset", self.handle_reset_runtime, methods=["POST"]),
             Route("/mrp/v1/execute", self.handle_execute, methods=["POST"]),
@@ -629,7 +794,7 @@ class MRPServer:
             Route("/mrp/v1/is_complete", self.handle_is_complete, methods=["POST"]),
             Route("/mrp/v1/format", self.handle_format, methods=["POST"]),
             Route("/mrp/v1/history", self.handle_history, methods=["POST"]),
-            Route("/mrp/v1/assets/{path:path}", self.handle_asset, methods=["GET"]),
+            Route("/mrp/v1/assets/{id}", self.handle_asset, methods=["GET"]),
         ]
 
 

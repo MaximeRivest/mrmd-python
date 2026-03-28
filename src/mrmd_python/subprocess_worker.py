@@ -23,6 +23,7 @@ import traceback
 import time
 import io
 import base64
+import uuid
 import threading
 import select
 from pathlib import Path
@@ -32,7 +33,7 @@ from typing import Any
 
 @dataclass
 class Asset:
-    path: str
+    id: str
     url: str
     mimeType: str
     assetType: str
@@ -58,7 +59,13 @@ class ExecuteResult:
     displayData: list[dict] = field(default_factory=list)
     assets: list[Asset] = field(default_factory=list)
     executionCount: int = 0
+    stateRevision: int = 0
     duration: int | None = None
+    warnings: list[dict[str, str]] = field(default_factory=list)
+
+
+class StdinNotAllowedError(Exception):
+    pass
 
 
 class SubprocessIPythonWorker:
@@ -147,6 +154,9 @@ class SubprocessIPythonWorker:
         except Exception:
             pass
 
+    def _new_asset_id(self, extension: str) -> str:
+        return f"asset-{uuid.uuid4().hex[:16]}.{extension}"
+
     def _save_asset(self, content: bytes, mime_type: str, extension: str) -> Asset | None:
         """Save content as an asset file."""
         if not self.assets_dir:
@@ -155,13 +165,8 @@ class SubprocessIPythonWorker:
         assets_path = Path(self.assets_dir)
         assets_path.mkdir(parents=True, exist_ok=True)
 
-        self._asset_counter += 1
-        if self._current_exec_id:
-            filename = f"{self._current_exec_id}_{self._asset_counter:04d}.{extension}"
-        else:
-            filename = f"output_{self._asset_counter:04d}.{extension}"
-
-        filepath = assets_path / filename
+        asset_id = self._new_asset_id(extension)
+        filepath = assets_path / asset_id
         filepath.write_bytes(content)
 
         asset_type = "file"
@@ -173,8 +178,8 @@ class SubprocessIPythonWorker:
             asset_type = "svg"
 
         return Asset(
-            path=str(filepath),
-            url=f"/mrp/v1/assets/{filename}",
+            id=asset_id,
+            url=f"/mrp/v1/assets/{asset_id}",
             mimeType=mime_type,
             assetType=asset_type,
             size=len(content),
@@ -260,17 +265,13 @@ class SubprocessIPythonWorker:
                         buf.seek(0)
                         png_bytes = buf.getvalue()
 
-                        worker._asset_counter += 1
-                        if worker._current_exec_id:
-                            filename = f"{worker._current_exec_id}_{worker._asset_counter:04d}.png"
-                        else:
-                            filename = f"figure_{worker._asset_counter:04d}.png"
-                        filepath = assets_path / filename
+                        asset_id = worker._new_asset_id("png")
+                        filepath = assets_path / asset_id
                         filepath.write_bytes(png_bytes)
 
                         asset = Asset(
-                            path=str(filepath),
-                            url=f"/mrp/v1/assets/{filename}",
+                            id=asset_id,
+                            url=f"/mrp/v1/assets/{asset_id}",
                             mimeType="image/png",
                             assetType="image",
                             size=len(png_bytes),
@@ -319,19 +320,13 @@ class SubprocessIPythonWorker:
                     buf.seek(0)
                     png_bytes = buf.getvalue()
 
-                    worker._asset_counter += 1
-                    if worker._current_exec_id:
-                        filename = (
-                            f"{worker._current_exec_id}_{worker._asset_counter:04d}.png"
-                        )
-                    else:
-                        filename = f"figure_{worker._asset_counter:04d}.png"
-                    filepath = assets_path / filename
+                    asset_id = worker._new_asset_id("png")
+                    filepath = assets_path / asset_id
                     filepath.write_bytes(png_bytes)
 
                     asset = Asset(
-                        path=str(filepath),
-                        url=f"/mrp/v1/assets/{filename}",
+                        id=asset_id,
+                        url=f"/mrp/v1/assets/{asset_id}",
                         mimeType="image/png",
                         assetType="image",
                         size=len(png_bytes),
@@ -343,7 +338,13 @@ class SubprocessIPythonWorker:
         _hooked_show._mrmd_hooked = True
         plt.show = _hooked_show
 
-    def execute(self, code: str, store_history: bool = True, exec_id: str | None = None) -> ExecuteResult:
+    def execute(
+        self,
+        code: str,
+        store_history: bool = True,
+        exec_id: str | None = None,
+        allow_stdin: bool = False,
+    ) -> ExecuteResult:
         """Execute code and return result."""
         self._ensure_initialized()
         self._captured_displays = []
@@ -354,17 +355,23 @@ class SubprocessIPythonWorker:
         sys.stdout = captured_stdout = io.StringIO()
         sys.stderr = captured_stderr = io.StringIO()
 
+        import builtins
+        import getpass as getpass_module
+        original_input = builtins.input
+        original_getpass = getpass_module.getpass
+
+        def disallow_stdin(*args, **kwargs):
+            raise StdinNotAllowedError("stdin is only supported when the client handles input")
+
+        builtins.input = disallow_stdin
+        getpass_module.getpass = disallow_stdin
+
         start_time = time.time()
         result = ExecuteResult()
 
         try:
-            # Ensure matplotlib hook is applied BEFORE execution
-            # (handles case where matplotlib was installed via %pip)
             self._ensure_matplotlib_hook()
-
             exec_result = self.shell.run_cell(code, store_history=store_history, silent=False)
-
-            # Also check after, in case user imported matplotlib during this cell
             self._ensure_matplotlib_hook()
 
             result.executionCount = self.shell.execution_count
@@ -382,26 +389,37 @@ class SubprocessIPythonWorker:
                     result.result = repr(obj)
                 except Exception:
                     result.result = "<repr failed>"
+                    result.warnings.append({"code": "repr_failed", "message": "Result repr failed; returned fallback preview"})
 
             if exec_result.error_in_exec:
-                result.error = self._format_exception(exec_result.error_in_exec)
+                if isinstance(exec_result.error_in_exec, StdinNotAllowedError):
+                    result.error = ExecuteError(type="StdinNotAllowed", message=str(exec_result.error_in_exec))
+                else:
+                    result.error = self._format_exception(exec_result.error_in_exec)
                 result.success = False
             elif exec_result.error_before_exec:
-                result.error = self._format_exception(exec_result.error_before_exec)
+                if isinstance(exec_result.error_before_exec, StdinNotAllowedError):
+                    result.error = ExecuteError(type="StdinNotAllowed", message=str(exec_result.error_before_exec))
+                else:
+                    result.error = self._format_exception(exec_result.error_before_exec)
                 result.success = False
 
-            # Convert display data
             for disp in self._captured_displays:
                 if "asset" in disp:
                     result.assets.append(Asset(**disp["asset"]))
                 elif "data" in disp:
                     result.displayData.append(disp)
 
+        except StdinNotAllowedError as e:
+            result.error = ExecuteError(type="StdinNotAllowed", message=str(e))
+            result.success = False
         except Exception as e:
             result.error = self._format_exception(e)
             result.success = False
 
         finally:
+            builtins.input = original_input
+            getpass_module.getpass = original_getpass
             sys.stdout, sys.stderr = old_stdout, old_stderr
             result.stdout = captured_stdout.getvalue()
             result.stderr = captured_stderr.getvalue()
@@ -416,6 +434,7 @@ class SubprocessIPythonWorker:
         output_fd: int,
         store_history: bool = True,
         exec_id: str | None = None,
+        allow_stdin: bool = False,
     ) -> ExecuteResult:
         """Execute code with streaming output to the given file descriptor."""
         self._ensure_initialized()
@@ -527,6 +546,17 @@ class SubprocessIPythonWorker:
         sys.stdout = io.TextIOWrapper(io.FileIO(1, mode="w", closefd=False), line_buffering=True)
         sys.stderr = io.TextIOWrapper(io.FileIO(2, mode="w", closefd=False), line_buffering=True)
 
+        import builtins
+        import getpass as getpass_module
+        original_input = builtins.input
+        original_getpass = getpass_module.getpass
+
+        def disallow_stdin(*args, **kwargs):
+            raise StdinNotAllowedError("stdin is only supported when the client handles input")
+
+        builtins.input = disallow_stdin
+        getpass_module.getpass = disallow_stdin
+
         result = ExecuteResult()
 
         try:
@@ -556,10 +586,16 @@ class SubprocessIPythonWorker:
                     result.result = "<repr failed>"
 
             if exec_result.error_in_exec:
-                result.error = self._format_exception(exec_result.error_in_exec)
+                if isinstance(exec_result.error_in_exec, StdinNotAllowedError):
+                    result.error = ExecuteError(type="StdinNotAllowed", message=str(exec_result.error_in_exec))
+                else:
+                    result.error = self._format_exception(exec_result.error_in_exec)
                 result.success = False
             elif exec_result.error_before_exec:
-                result.error = self._format_exception(exec_result.error_before_exec)
+                if isinstance(exec_result.error_before_exec, StdinNotAllowedError):
+                    result.error = ExecuteError(type="StdinNotAllowed", message=str(exec_result.error_before_exec))
+                else:
+                    result.error = self._format_exception(exec_result.error_before_exec)
                 result.success = False
 
             for disp in self._captured_displays:
@@ -571,11 +607,16 @@ class SubprocessIPythonWorker:
         except KeyboardInterrupt:
             result.error = ExecuteError(type="KeyboardInterrupt", message="Interrupted")
             result.success = False
+        except StdinNotAllowedError as e:
+            result.error = ExecuteError(type="StdinNotAllowed", message=str(e))
+            result.success = False
         except Exception as e:
             result.error = self._format_exception(e)
             result.success = False
 
         finally:
+            builtins.input = original_input
+            getpass_module.getpass = original_getpass
             sys.stdout.flush()
             sys.stderr.flush()
 
@@ -756,6 +797,15 @@ class SubprocessIPythonWorker:
         self._ensure_initialized()
         self.shell.reset()
 
+    def clear_history(self) -> bool:
+        """Clear execution history."""
+        self._ensure_initialized()
+        try:
+            self.shell.history_manager.reset()
+            return True
+        except Exception:
+            return False
+
     def is_complete(self, code: str) -> dict:
         """Check if code is a complete statement."""
         self._ensure_initialized()
@@ -882,6 +932,7 @@ def main():
                     code=request.get("code", ""),
                     store_history=request.get("storeHistory", True),
                     exec_id=request.get("execId"),
+                    allow_stdin=request.get("allowStdin", False),
                 )
                 response = {"type": "result", "result": _dataclass_to_dict(result)}
 
@@ -900,6 +951,7 @@ def main():
                     output_fd=write_fd,
                     store_history=request.get("storeHistory", True),
                     exec_id=request.get("execId"),
+                    allow_stdin=request.get("allowStdin", False),
                 )
 
                 response = {"type": "result", "result": _dataclass_to_dict(result)}
@@ -933,6 +985,9 @@ def main():
             elif cmd == "reset":
                 worker.reset()
                 response = {"type": "reset", "success": True}
+
+            elif cmd == "clear_history":
+                response = {"type": "clear_history", "success": worker.clear_history()}
 
             elif cmd == "is_complete":
                 result = worker.is_complete(code=request.get("code", ""))

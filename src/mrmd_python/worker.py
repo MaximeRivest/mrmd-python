@@ -22,6 +22,7 @@ import select
 import time
 import base64
 import re
+import uuid
 from pathlib import Path
 from typing import Any, Callable
 from dataclasses import dataclass, field, asdict
@@ -43,6 +44,7 @@ from .types import (
     HistoryResult,
     StdinRequest,
     InputCancelledError,
+    StdinNotAllowedError,
 )
 from .subprocess_manager import SubprocessWorker
 
@@ -253,6 +255,10 @@ class IPythonWorker:
         except ImportError:
             pass
 
+    def _new_asset_id(self, extension: str) -> str:
+        """Create a server-generated opaque asset ID."""
+        return f"asset-{uuid.uuid4().hex[:16]}.{extension}"
+
     def _save_asset(
         self, content: bytes, mime_type: str, extension: str
     ) -> Asset | None:
@@ -263,13 +269,8 @@ class IPythonWorker:
         assets_path = Path(self.assets_dir)
         assets_path.mkdir(parents=True, exist_ok=True)
 
-        self._asset_counter += 1
-        if self._current_exec_id:
-            filename = f"{self._current_exec_id}_{self._asset_counter:04d}.{extension}"
-        else:
-            filename = f"output_{self._asset_counter:04d}.{extension}"
-
-        filepath = assets_path / filename
+        asset_id = self._new_asset_id(extension)
+        filepath = assets_path / asset_id
         filepath.write_bytes(content)
 
         # Determine asset type
@@ -282,8 +283,8 @@ class IPythonWorker:
             asset_type = "svg"
 
         return Asset(
-            path=str(filepath),
-            url=f"/mrp/v1/assets/{filename}",
+            id=asset_id,
+            url=f"/mrp/v1/assets/{asset_id}",
             mimeType=mime_type,
             assetType=asset_type,
             size=len(content),
@@ -522,17 +523,13 @@ class IPythonWorker:
                         buf.seek(0)
                         png_bytes = buf.getvalue()
 
-                        worker._asset_counter += 1
-                        if worker._current_exec_id:
-                            filename = f"{worker._current_exec_id}_{worker._asset_counter:04d}.png"
-                        else:
-                            filename = f"figure_{worker._asset_counter:04d}.png"
-                        filepath = assets_path / filename
+                        asset_id = worker._new_asset_id("png")
+                        filepath = assets_path / asset_id
                         filepath.write_bytes(png_bytes)
 
                         asset = Asset(
-                            path=str(filepath),
-                            url=f"/mrp/v1/assets/{filename}",
+                            id=asset_id,
+                            url=f"/mrp/v1/assets/{asset_id}",
                             mimeType="image/png",
                             assetType="image",
                             size=len(png_bytes),
@@ -580,19 +577,13 @@ class IPythonWorker:
                     buf.seek(0)
                     png_bytes = buf.getvalue()
 
-                    worker._asset_counter += 1
-                    if worker._current_exec_id:
-                        filename = (
-                            f"{worker._current_exec_id}_{worker._asset_counter:04d}.png"
-                        )
-                    else:
-                        filename = f"figure_{worker._asset_counter:04d}.png"
-                    filepath = assets_path / filename
+                    asset_id = worker._new_asset_id("png")
+                    filepath = assets_path / asset_id
                     filepath.write_bytes(png_bytes)
 
                     asset = Asset(
-                        path=str(filepath),
-                        url=f"/mrp/v1/assets/{filename}",
+                        id=asset_id,
+                        url=f"/mrp/v1/assets/{asset_id}",
                         mimeType="image/png",
                         assetType="image",
                         size=len(png_bytes),
@@ -686,12 +677,21 @@ class IPythonWorker:
     # =========================================================================
 
     def _execute_subprocess(
-        self, code: str, exec_id: str | None = None
+        self,
+        code: str,
+        exec_id: str | None = None,
+        store_history: bool = True,
+        allow_stdin: bool = False,
     ) -> ExecuteResult:
         """Execute code using the persistent SubprocessWorker (IPython-based)."""
         try:
             worker = self._get_subprocess_worker()
-            return worker.execute(code, store_history=True, exec_id=exec_id)
+            return worker.execute(
+                code,
+                store_history=store_history,
+                exec_id=exec_id,
+                allow_stdin=allow_stdin,
+            )
         except Exception as e:
             return ExecuteResult(
                 success=False,
@@ -707,6 +707,9 @@ class IPythonWorker:
         code: str,
         on_output: Callable[[str, str, str], None],
         exec_id: str | None = None,
+        store_history: bool = True,
+        allow_stdin: bool = True,
+        on_stdin_request: Callable[[StdinRequest], str] | None = None,
     ) -> ExecuteResult:
         """Execute code using the persistent SubprocessWorker with streaming."""
         try:
@@ -714,8 +717,10 @@ class IPythonWorker:
             return worker.execute_streaming(
                 code,
                 on_output=on_output,
-                store_history=True,
+                store_history=store_history,
                 exec_id=exec_id,
+                allow_stdin=allow_stdin,
+                on_stdin_request=on_stdin_request,
             )
         except Exception as e:
             return ExecuteResult(
@@ -728,12 +733,26 @@ class IPythonWorker:
             )
 
     def execute(
-        self, code: str, store_history: bool = True, exec_id: str | None = None
+        self,
+        code: str,
+        store_history: bool = True,
+        exec_id: str | None = None,
+        allow_stdin: bool = False,
     ) -> ExecuteResult:
-        """Execute code and return result (non-streaming)."""
+        """Execute code and return result (non-streaming).
+
+        Synchronous execution does not support interactive stdin round-trips.
+        If code calls input()/getpass(), execution fails with StdinNotAllowed
+        instead of hanging the runtime.
+        """
         # Use subprocess execution if venv differs from current Python
         if self._should_use_subprocess():
-            return self._execute_subprocess(code, exec_id)
+            return self._execute_subprocess(
+                code,
+                exec_id,
+                store_history=store_history,
+                allow_stdin=allow_stdin,
+            )
 
         self._ensure_initialized()
         self._captured_displays = []
@@ -743,6 +762,19 @@ class IPythonWorker:
         old_stdout, old_stderr = sys.stdout, sys.stderr
         sys.stdout = captured_stdout = io.StringIO()
         sys.stderr = captured_stderr = io.StringIO()
+
+        import builtins
+        import getpass as getpass_module
+        original_input = builtins.input
+        original_getpass = getpass_module.getpass
+
+        def disallow_stdin(*args, **kwargs):
+            raise StdinNotAllowedError(
+                "stdin is only supported with /execute/stream when the client handles input"
+            )
+
+        builtins.input = disallow_stdin
+        getpass_module.getpass = disallow_stdin
 
         start_time = time.time()
         result = ExecuteResult()
@@ -772,12 +804,22 @@ class IPythonWorker:
                     result.result = repr(obj)
                 except Exception:
                     result.result = "<repr failed>"
+                    result.warnings.append({
+                        "code": "repr_failed",
+                        "message": "Result repr failed; returned fallback preview",
+                    })
 
             if exec_result.error_in_exec:
-                result.error = self._format_exception(exec_result.error_in_exec)
+                if isinstance(exec_result.error_in_exec, StdinNotAllowedError):
+                    result.error = ExecuteError(type="StdinNotAllowed", message=str(exec_result.error_in_exec))
+                else:
+                    result.error = self._format_exception(exec_result.error_in_exec)
                 result.success = False
             elif exec_result.error_before_exec:
-                result.error = self._format_exception(exec_result.error_before_exec)
+                if isinstance(exec_result.error_before_exec, StdinNotAllowedError):
+                    result.error = ExecuteError(type="StdinNotAllowed", message=str(exec_result.error_before_exec))
+                else:
+                    result.error = self._format_exception(exec_result.error_before_exec)
                 result.success = False
 
             # Convert display data
@@ -789,11 +831,16 @@ class IPythonWorker:
                         DisplayData(data=disp["data"], metadata=disp.get("metadata", {}))
                     )
 
+        except StdinNotAllowedError as e:
+            result.error = ExecuteError(type="StdinNotAllowed", message=str(e))
+            result.success = False
         except Exception as e:
             result.error = self._format_exception(e)
             result.success = False
 
         finally:
+            builtins.input = original_input
+            getpass_module.getpass = original_getpass
             sys.stdout, sys.stderr = old_stdout, old_stderr
             result.stdout = captured_stdout.getvalue()
             result.stderr = captured_stderr.getvalue()
@@ -809,6 +856,7 @@ class IPythonWorker:
         store_history: bool = True,
         exec_id: str | None = None,
         on_stdin_request: Callable[[StdinRequest], str] | None = None,
+        allow_stdin: bool = True,
     ) -> ExecuteResult:
         """
         Execute code with streaming output and optional stdin support.
@@ -826,7 +874,14 @@ class IPythonWorker:
         """
         # Use subprocess execution if venv differs from current Python
         if self._should_use_subprocess():
-            return self._execute_subprocess_streaming(code, on_output, exec_id)
+            return self._execute_subprocess_streaming(
+                code,
+                on_output,
+                exec_id,
+                store_history=store_history,
+                allow_stdin=allow_stdin,
+                on_stdin_request=on_stdin_request,
+            )
 
         self._ensure_initialized()
         self._captured_displays = []
@@ -936,10 +991,9 @@ class IPythonWorker:
 
         def hooked_input(prompt=""):
             """Custom input() that uses the stdin callback."""
-            if on_stdin_request is None:
-                raise RuntimeError(
-                    "input() is not supported in this execution context. "
-                    "The client must provide stdin support."
+            if on_stdin_request is None or not allow_stdin:
+                raise StdinNotAllowedError(
+                    "stdin is only supported when the client handles input"
                 )
 
             # Flush stdout so prompt appears before we request input
@@ -968,10 +1022,9 @@ class IPythonWorker:
 
         def hooked_getpass(prompt="Password: ", stream=None):
             """Custom getpass() that uses the stdin callback with password=True."""
-            if on_stdin_request is None:
-                raise RuntimeError(
-                    "getpass() is not supported in this execution context. "
-                    "The client must provide stdin support."
+            if on_stdin_request is None or not allow_stdin:
+                raise StdinNotAllowedError(
+                    "stdin is only supported when the client handles input"
                 )
 
             # Flush stdout so prompt appears before we request input
@@ -1026,10 +1079,16 @@ class IPythonWorker:
                     result.result = "<repr failed>"
 
             if exec_result.error_in_exec:
-                result.error = self._format_exception(exec_result.error_in_exec)
+                if isinstance(exec_result.error_in_exec, StdinNotAllowedError):
+                    result.error = ExecuteError(type="StdinNotAllowed", message=str(exec_result.error_in_exec))
+                else:
+                    result.error = self._format_exception(exec_result.error_in_exec)
                 result.success = False
             elif exec_result.error_before_exec:
-                result.error = self._format_exception(exec_result.error_before_exec)
+                if isinstance(exec_result.error_before_exec, StdinNotAllowedError):
+                    result.error = ExecuteError(type="StdinNotAllowed", message=str(exec_result.error_before_exec))
+                else:
+                    result.error = self._format_exception(exec_result.error_before_exec)
                 result.success = False
 
             for disp in self._captured_displays:
@@ -1051,12 +1110,17 @@ class IPythonWorker:
                 type="InputCancelled", message="Input cancelled by user"
             )
             result.success = False
+        except StdinNotAllowedError as e:
+            result.error = ExecuteError(type="StdinNotAllowed", message=str(e))
+            result.success = False
         except Exception as e:
             # Check if this is an InputCancelledError wrapped in another exception
             if "Input cancelled" in str(e) or isinstance(e.__cause__, InputCancelledError):
                 result.error = ExecuteError(
                     type="InputCancelled", message="Input cancelled by user"
                 )
+            elif isinstance(e.__cause__, StdinNotAllowedError) or "stdin is only supported" in str(e):
+                result.error = ExecuteError(type="StdinNotAllowed", message="stdin is only supported when the client handles input")
             else:
                 result.error = self._format_exception(e)
             result.success = False
@@ -2038,6 +2102,17 @@ class IPythonWorker:
             self._subprocess_worker.reset()
         elif self._initialized:
             self.shell.reset()
+
+    def clear_history(self) -> bool:
+        """Clear execution history if supported."""
+        try:
+            if self._subprocess_worker is not None:
+                return self._subprocess_worker.clear_history()
+            self._ensure_initialized()
+            self.shell.history_manager.reset()
+            return True
+        except Exception:
+            return False
 
     def shutdown(self):
         """Shutdown the worker, cleaning up subprocess if needed."""

@@ -136,16 +136,22 @@ class DaemonRuntimeClient:
         response.raise_for_status()
         return response.json()
 
+    def health(self) -> dict:
+        """Get runtime health and current state."""
+        return self._get("/health")
+
     def execute(
         self,
         code: str,
         store_history: bool = True,
         exec_id: Optional[str] = None,
+        allow_stdin: bool = False,
     ) -> ExecuteResult:
         """Execute code in the daemon runtime."""
         data = {
             "code": code,
             "storeHistory": store_history,
+            "allowStdin": allow_stdin,
         }
         if exec_id:
             data["execId"] = exec_id
@@ -160,6 +166,8 @@ class DaemonRuntimeClient:
         store_history: bool = True,
         exec_id: Optional[str] = None,
         on_stdin_request: Optional[Callable] = None,
+        allow_stdin: bool = True,
+        on_event: Optional[Callable[[str, dict], None]] = None,
     ) -> ExecuteResult:
         """
         Execute code with streaming output.
@@ -171,6 +179,7 @@ class DaemonRuntimeClient:
         data = {
             "code": code,
             "storeHistory": store_history,
+            "allowStdin": allow_stdin,
         }
         if exec_id:
             data["execId"] = exec_id
@@ -180,8 +189,9 @@ class DaemonRuntimeClient:
 
         # Use httpx streaming for SSE
         with self._client.stream("POST", "/execute/stream", json=data) as response:
+            event_type = None
             for line in response.iter_lines():
-                if not line:
+                if not line or line.startswith(":"):
                     continue
 
                 if line.startswith("event:"):
@@ -191,7 +201,7 @@ class DaemonRuntimeClient:
 
                     if event_type in ("stdout", "stderr"):
                         content = event_data.get("content", "")
-                        accumulated[event_type] = event_data.get("accumulated", accumulated[event_type] + content)
+                        accumulated[event_type] = accumulated[event_type] + content
                         on_output(event_type, content, accumulated[event_type])
                     elif event_type == "result":
                         final_result = self._parse_execute_result(event_data)
@@ -203,6 +213,10 @@ class DaemonRuntimeClient:
                                 message=event_data.get("message", ""),
                                 traceback=event_data.get("traceback", []),
                             ),
+                            executionCount=event_data.get("executionCount", 0),
+                            stateRevision=event_data.get("stateRevision", 0),
+                            duration=event_data.get("duration"),
+                            warnings=event_data.get("warnings", []),
                         )
                     elif event_type == "stdin_request":
                         if on_stdin_request:
@@ -212,11 +226,13 @@ class DaemonRuntimeClient:
                                 password=event_data.get("password", False),
                                 execId=event_data.get("execId", ""),
                             ))
-                            # Send input back
                             self._post("/input", {
-                                "exec_id": event_data.get("execId", ""),
+                                "execId": event_data.get("execId", ""),
                                 "text": response_text,
                             })
+                    elif event_type in ("display", "asset", "warning"):
+                        if on_event:
+                            on_event(event_type, event_data)
 
         return final_result or ExecuteResult(success=False)
 
@@ -303,6 +319,7 @@ class DaemonRuntimeClient:
             variables=variables,
             count=result.get("count", len(variables)),
             truncated=result.get("truncated", False),
+            warnings=result.get("warnings", []),
         )
 
     def get_variable_detail(self, name: str, path: Optional[list[str]] = None) -> VariableDetail:
@@ -381,7 +398,13 @@ class DaemonRuntimeClient:
     def reset(self):
         """Reset the runtime namespace."""
         self._ensure_connected()
-        self._client.post("/reset")
+        self._client.post("/reset", json={"scope": ["namespace"]})
+
+    def clear_history(self) -> bool:
+        """Clear execution history."""
+        self._ensure_connected()
+        response = self._client.post("/reset", json={"scope": ["history"]})
+        return response.is_success
 
     def get_info(self) -> dict:
         """Get info about the daemon runtime."""
@@ -446,7 +469,7 @@ class DaemonRuntimeClient:
         assets = []
         for a in data.get("assets", []):
             assets.append(Asset(
-                path=a.get("path", ""),
+                id=a.get("id", ""),
                 url=a.get("url", ""),
                 mimeType=a.get("mimeType", ""),
                 assetType=a.get("assetType", ""),
@@ -469,7 +492,9 @@ class DaemonRuntimeClient:
             displayData=display_data,
             assets=assets,
             executionCount=data.get("executionCount", 0),
+            stateRevision=data.get("stateRevision", 0),
             duration=data.get("duration"),
+            warnings=data.get("warnings", []),
         )
 
     def _format_exception(self, exc: Exception) -> ExecuteError:

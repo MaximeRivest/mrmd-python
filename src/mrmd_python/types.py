@@ -39,8 +39,10 @@ class Environment:
 
 @dataclass
 class Capabilities:
+    protocol: str = "mrp"
+    protocolVersion: str = "0.3.0"
     runtime: str = "mrmd-python"
-    version: str = ""
+    version: str = "0.3.0"
     languages: list[str] = field(default_factory=lambda: ["python", "py", "python3"])
     features: CapabilityFeatures = field(default_factory=CapabilityFeatures)
     environment: Environment = field(default_factory=Environment)
@@ -63,13 +65,13 @@ class ExecuteError:
 
 @dataclass
 class DisplayData:
-    data: dict[str, str] = field(default_factory=dict)
+    data: dict[str, Any] = field(default_factory=dict)
     metadata: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass
 class Asset:
-    path: str
+    id: str
     url: str
     mimeType: str
     assetType: Literal["image", "html", "svg", "data", "file"]
@@ -86,8 +88,10 @@ class ExecuteResult:
     displayData: list[DisplayData] = field(default_factory=list)
     assets: list[Asset] = field(default_factory=list)
     executionCount: int = 0
+    stateRevision: int = 0
     duration: int | None = None  # milliseconds
     imports: list[str] = field(default_factory=list)
+    warnings: list[dict[str, str]] = field(default_factory=list)
 
 
 # =============================================================================
@@ -182,6 +186,7 @@ class VariablesResult:
     variables: list[Variable] = field(default_factory=list)
     count: int = 0
     truncated: bool = False
+    warnings: list[dict[str, str]] = field(default_factory=list)
 
 
 @dataclass
@@ -240,4 +245,9 @@ class StdinRequest:
 
 class InputCancelledError(Exception):
     """Raised when user cancels input request."""
+    pass
+
+
+class StdinNotAllowedError(Exception):
+    """Raised when code requests stdin in a non-interactive execution context."""
     pass
