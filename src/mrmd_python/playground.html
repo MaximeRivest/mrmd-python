@@ -6,10 +6,25 @@
 <title>MRP Playground</title>
 <style>
   :root {
-    --bg: #0d1117; --surface: #161b22; --border: #30363d;
-    --text: #e6edf3; --muted: #8b949e; --accent: #58a6ff;
-    --green: #3fb950; --red: #f85149; --yellow: #d29922;
+    --bg: #ffffff; --surface: #f6f8fa; --border: #d0d7de;
+    --text: #1f2328; --muted: #656d76; --accent: #0969da;
+    --green: #1a7f37; --red: #cf222e; --yellow: #9a6700;
+    --hover-bg: rgba(9,105,218,0.06);
+    --active-bg: rgba(9,105,218,0.1);
+    --green-bg: rgba(26,127,55,0.1); --red-bg: rgba(207,34,46,0.1);
+    --yellow-bg: rgba(154,103,0,0.1); --accent-bg: rgba(9,105,218,0.1);
     --font: 'SF Mono', 'Cascadia Code', 'Fira Code', monospace;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #0d1117; --surface: #161b22; --border: #30363d;
+      --text: #e6edf3; --muted: #8b949e; --accent: #58a6ff;
+      --green: #3fb950; --red: #f85149; --yellow: #d29922;
+      --hover-bg: rgba(88,166,255,0.06);
+      --active-bg: rgba(88,166,255,0.15);
+      --green-bg: rgba(63,185,80,0.2); --red-bg: rgba(248,81,73,0.2);
+      --yellow-bg: rgba(210,153,34,0.2); --accent-bg: rgba(88,166,255,0.2);
+    }
   }
   * { box-sizing: border-box; margin: 0; padding: 0; }
   body { font-family: var(--font); background: var(--bg); color: var(--text); font-size: 13px; }
@@ -25,7 +40,19 @@
   header .dot.dead { background: var(--red); }
   header .runtime-info { margin-left: auto; font-size: 11px; color: var(--muted); }
 
-  .container { display: flex; height: calc(100vh - 49px); }
+  .tab-bar {
+    display: flex; border-bottom: 1px solid var(--border); background: var(--surface);
+    padding: 0 20px;
+  }
+  .tab-bar button {
+    padding: 8px 16px; background: none; border: none; border-bottom: 2px solid transparent;
+    color: var(--muted); font: inherit; font-size: 12px; font-weight: 600;
+    cursor: pointer; margin-bottom: -1px;
+  }
+  .tab-bar button:hover { color: var(--text); }
+  .tab-bar button.active { color: var(--accent); border-bottom-color: var(--accent); }
+
+  .container { display: flex; height: calc(100vh - 82px); }
 
   /* Sidebar */
   nav {
@@ -39,14 +66,14 @@
     padding: 6px 16px; background: none; border: none; color: var(--text);
     font: inherit; font-size: 12px; cursor: pointer; text-align: left;
   }
-  nav button:hover { background: rgba(88,166,255,0.1); }
-  nav button.active { background: rgba(88,166,255,0.15); color: var(--accent); }
+  nav button:hover { background: var(--hover-bg); }
+  nav button.active { background: var(--active-bg); color: var(--accent); }
   nav .method {
     font-size: 10px; font-weight: 700; padding: 1px 4px; border-radius: 3px;
     min-width: 32px; text-align: center;
   }
-  nav .method.get { background: rgba(63,185,80,0.2); color: var(--green); }
-  nav .method.post { background: rgba(88,166,255,0.2); color: var(--accent); }
+  nav .method.get { background: var(--green-bg); color: var(--green); }
+  nav .method.post { background: var(--accent-bg); color: var(--accent); }
 
   /* Main */
   main { flex: 1; display: flex; flex-direction: column; overflow: hidden; }
@@ -71,10 +98,10 @@
     padding: 1px 6px; border-radius: 3px; font-size: 10px;
     font-weight: 600; text-transform: none; letter-spacing: 0;
   }
-  .badge.s200 { background: rgba(63,185,80,0.2); color: var(--green); }
-  .badge.s4xx { background: rgba(248,81,73,0.2); color: var(--red); }
-  .badge.s5xx { background: rgba(248,81,73,0.2); color: var(--red); }
-  .badge.sse { background: rgba(210,153,34,0.2); color: var(--yellow); }
+  .badge.s200 { background: var(--green-bg); color: var(--green); }
+  .badge.s4xx { background: var(--red-bg); color: var(--red); }
+  .badge.s5xx { background: var(--red-bg); color: var(--red); }
+  .badge.sse { background: var(--yellow-bg); color: var(--yellow); }
 
   textarea {
     flex: 1; background: var(--bg); color: var(--text); border: none;
@@ -96,15 +123,15 @@
     cursor: pointer;
   }
   .btn:hover { border-color: var(--accent); }
-  .btn.primary { background: rgba(88,166,255,0.15); border-color: var(--accent); color: var(--accent); }
-  .btn.danger { background: rgba(248,81,73,0.1); border-color: var(--red); color: var(--red); }
+  .btn.primary { background: var(--active-bg); border-color: var(--accent); color: var(--accent); }
+  .btn.danger { background: var(--red-bg); border-color: var(--red); color: var(--red); }
   .toolbar .spacer { flex: 1; }
   .toolbar .time { font-size: 11px; color: var(--muted); }
 
   /* SSE log */
   .sse-log { flex: 1; overflow: auto; background: var(--bg); padding: 4px 0; }
   .sse-event {
-    padding: 2px 16px; font-size: 12px; border-bottom: 1px solid rgba(48,54,61,0.3);
+    padding: 2px 16px; font-size: 12px; border-bottom: 1px solid var(--border);
   }
   .sse-event .ev-type { color: var(--yellow); font-weight: 600; margin-right: 8px; }
   .sse-event .ev-data { color: var(--text); }
@@ -114,7 +141,7 @@
   .var-row {
     padding: 3px 16px; font-size: 12px; display: flex; gap: 12px; cursor: pointer;
   }
-  .var-row:hover { background: rgba(88,166,255,0.06); }
+  .var-row:hover { background: var(--hover-bg); }
   .var-name { color: var(--accent); min-width: 120px; }
   .var-type { color: var(--muted); min-width: 80px; }
   .var-value { color: var(--text); flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
@@ -137,7 +164,6 @@
   nav button.seq-btn {
     padding-left: 12px; font-size: 11px; line-height: 1.4;
   }
-  nav button.seq-btn .seq-icon { font-size: 13px; min-width: 20px; text-align: center; }
 
   .seq-header {
     padding: 16px 20px; border-bottom: 1px solid var(--border);
@@ -162,15 +188,15 @@
     display: flex; align-items: center; gap: 10px; padding: 10px 20px;
     cursor: pointer; user-select: none;
   }
-  .seq-step-header:hover { background: rgba(88,166,255,0.04); }
+  .seq-step-header:hover { background: var(--hover-bg); }
   .seq-step-num {
     width: 22px; height: 22px; border-radius: 50%; display: flex; align-items: center;
     justify-content: center; font-size: 11px; font-weight: 700; flex-shrink: 0;
     background: var(--border); color: var(--muted);
   }
-  .seq-step.done .seq-step-num { background: rgba(63,185,80,0.2); color: var(--green); }
-  .seq-step.fail .seq-step-num { background: rgba(248,81,73,0.2); color: var(--red); }
-  .seq-step.running .seq-step-num { background: rgba(88,166,255,0.2); color: var(--accent); }
+  .seq-step.done .seq-step-num { background: var(--green-bg); color: var(--green); }
+  .seq-step.fail .seq-step-num { background: var(--red-bg); color: var(--red); }
+  .seq-step.running .seq-step-num { background: var(--accent-bg); color: var(--accent); }
   .seq-step.skipped .seq-step-num { background: var(--border); color: var(--muted); opacity: 0.5; }
   .seq-step-title {
     flex: 1; font-size: 12px;
@@ -180,13 +206,13 @@
   .seq-step-method {
     font-size: 10px; font-weight: 700; padding: 1px 4px; border-radius: 3px;
   }
-  .seq-step-method.get { background: rgba(63,185,80,0.2); color: var(--green); }
-  .seq-step-method.post { background: rgba(88,166,255,0.2); color: var(--accent); }
+  .seq-step-method.get { background: var(--green-bg); color: var(--green); }
+  .seq-step-method.post { background: var(--accent-bg); color: var(--accent); }
   .seq-step-time { font-size: 11px; color: var(--muted); min-width: 50px; text-align: right; }
   .seq-step-status { font-size: 10px; font-weight: 600; padding: 1px 6px; border-radius: 3px; }
-  .seq-step-status.s2xx { background: rgba(63,185,80,0.15); color: var(--green); }
-  .seq-step-status.s4xx { background: rgba(248,81,73,0.15); color: var(--red); }
-  .seq-step-status.sse-ok { background: rgba(210,153,34,0.15); color: var(--yellow); }
+  .seq-step-status.s2xx { background: var(--green-bg); color: var(--green); }
+  .seq-step-status.s4xx { background: var(--red-bg); color: var(--red); }
+  .seq-step-status.sse-ok { background: var(--yellow-bg); color: var(--yellow); }
 
   .seq-step-detail {
     display: none; padding: 0 20px 12px 52px;
@@ -223,15 +249,43 @@
     font-size: 12px; z-index: 100; opacity: 0; transition: opacity 0.3s;
   }
   .toast.show { opacity: 1; }
+
+  /* Input modal */
+  .modal-overlay {
+    position: fixed; inset: 0; background: rgba(0,0,0,0.4); z-index: 200;
+    display: flex; align-items: center; justify-content: center;
+  }
+  .modal {
+    background: var(--surface); border: 1px solid var(--border); border-radius: 8px;
+    padding: 20px; width: 400px; max-width: 90vw;
+  }
+  .modal label {
+    display: block; font-size: 12px; font-weight: 600; margin-bottom: 8px;
+  }
+  .modal .modal-hint {
+    font-size: 11px; color: var(--muted); margin-bottom: 12px;
+  }
+  .modal input[type="text"] {
+    width: 100%; background: var(--bg); border: 1px solid var(--border); border-radius: 4px;
+    color: var(--text); font: inherit; font-size: 13px; padding: 6px 10px;
+    margin-bottom: 16px;
+  }
+  .modal input[type="text"]:focus { outline: none; border-color: var(--accent); }
+  .modal .modal-actions { display: flex; gap: 8px; justify-content: flex-end; }
 </style>
 </head>
 <body>
 
 <header>
   <h1>MRP Playground</h1>
-  <div class="status"><div class="dot" id="statusDot"></div><span id="statusText">connecting…</span></div>
+  <div class="status"><div class="dot" id="statusDot"></div><span id="statusText">connecting...</span></div>
   <div class="runtime-info" id="runtimeInfo"></div>
 </header>
+
+<div class="tab-bar">
+  <button class="active" id="tabSequences" onclick="switchTab('sequences')">Sequences</button>
+  <button id="tabEndpoints" onclick="switchTab('endpoints')">Endpoints</button>
+</div>
 
 <div class="container">
   <nav id="sidebar"></nav>
@@ -245,7 +299,6 @@
 const BASE = (() => {
   const params = new URLSearchParams(location.search);
   if (params.has('url')) return params.get('url').replace(/\/$/, '');
-  // If served from the runtime itself, use same origin
   if (location.pathname.startsWith('/mrp/')) return location.origin + '/mrp/v1';
   return 'http://localhost:39885/mrp/v1';
 })();
@@ -254,7 +307,6 @@ const BASE = (() => {
 const SEQUENCES = [
   {
     id: 'connect',
-    icon: '',
     title: 'Connect & Discover',
     desc: 'The first thing any client does: check the runtime is alive, discover capabilities, and adapt the UI.',
     steps: [
@@ -266,7 +318,6 @@ const SEQUENCES = [
   },
   {
     id: 'basic-exec',
-    icon: '',
     title: 'Execute & Inspect State',
     desc: 'Run code, then inspect the resulting namespace — the core notebook loop.',
     steps: [
@@ -292,7 +343,6 @@ const SEQUENCES = [
   },
   {
     id: 'streaming',
-    icon: '',
     title: 'Streaming Execution',
     desc: 'Execute long-running code with SSE streaming — see output as it happens.',
     steps: [
@@ -306,7 +356,6 @@ const SEQUENCES = [
   },
   {
     id: 'interrupt',
-    icon: '',
     title: 'Interrupt & Conflict',
     desc: 'What happens when you try to execute while something is already running? How to interrupt.',
     steps: [
@@ -327,7 +376,6 @@ const SEQUENCES = [
   },
   {
     id: 'completions',
-    icon: '',
     title: 'Runtime Completions',
     desc: 'Completions powered by live runtime state — knows actual variable values and types.',
     steps: [
@@ -347,7 +395,6 @@ const SEQUENCES = [
   },
   {
     id: 'error-handling',
-    icon: '',
     title: 'Errors & Code Analysis',
     desc: 'How errors are reported, and how to check code validity before executing.',
     steps: [
@@ -371,7 +418,6 @@ const SEQUENCES = [
   },
   {
     id: 'rich-output',
-    icon: '',
     title: 'Rich Output & Assets',
     desc: 'Display data with HTML tables, and generate plot assets served via /assets/{id}.',
     steps: [
@@ -385,7 +431,6 @@ const SEQUENCES = [
   },
   {
     id: 'stdin',
-    icon: '',
     title: 'Interactive Input (stdin)',
     desc: 'Handle code that calls input() — the runtime requests stdin and the client provides it.',
     steps: [
@@ -393,7 +438,8 @@ const SEQUENCES = [
         body: { code: 'name = input("What is your name? ")\nprint(f"Hello, {name}!")', storeHistory: true, allowStdin: true, execId: 'seq-stdin-1' },
         comment: 'Watch for the stdin_request SSE event — that\'s the runtime asking for input.' },
       { label: 'Send input', desc: 'Provide the answer', method: 'POST', path: '/input', delay: 800,
-        body: { execId: 'seq-stdin-1', text: 'World\n' },
+        body: { execId: 'seq-stdin-1', text: '' },
+        promptInput: { label: 'What is your name?', placeholder: 'Type your response...', bodyField: 'text', appendNewline: true },
         comment: 'Include \\n to submit. The execution continues and prints the greeting.' },
       { label: 'Verify result', desc: 'Check the variable was set', method: 'POST', path: '/hover', delay: 1000,
         body: { code: 'name', cursor: 4 },
@@ -402,7 +448,6 @@ const SEQUENCES = [
   },
   {
     id: 'stdin-blocked',
-    icon: '',
     title: 'Stdin Blocked (Agent Mode)',
     desc: 'When allowStdin is false, input() calls fail immediately instead of hanging — essential for AI agents.',
     steps: [
@@ -459,46 +504,54 @@ const ENDPOINTS = [
 let activeEndpoint = null;
 let capabilities = null;
 let currentAbort = null;
+let currentTab = 'sequences';
+
+// --- Tabs ---
+function switchTab(tab) {
+  currentTab = tab;
+  document.getElementById('tabSequences').classList.toggle('active', tab === 'sequences');
+  document.getElementById('tabEndpoints').classList.toggle('active', tab === 'endpoints');
+  activeEndpoint = null;
+  activeSequence = null;
+  renderSidebar();
+  const main = document.getElementById('main');
+  if (tab === 'sequences') {
+    selectSequence(SEQUENCES[0]);
+  } else {
+    const first = ENDPOINTS.find(e => e.id);
+    if (first) selectEndpoint(first);
+  }
+}
 
 // --- Sidebar ---
 const sidebar = document.getElementById('sidebar');
 function renderSidebar() {
   sidebar.innerHTML = '';
 
-  // Sequences section
-  const seqSection = document.createElement('div');
-  seqSection.className = 'section';
-  seqSection.textContent = 'Sequences';
-  sidebar.appendChild(seqSection);
-
-  for (const seq of SEQUENCES) {
-    const btn = document.createElement('button');
-    btn.className = 'seq-btn';
-    btn.dataset.id = 'seq-' + seq.id;
-    btn.innerHTML = seq.title;
-    btn.onclick = () => selectSequence(seq);
-    sidebar.appendChild(btn);
-  }
-
-  // Divider
-  const hr = document.createElement('div');
-  hr.style.cssText = 'border-top:1px solid var(--border);margin:8px 0';
-  sidebar.appendChild(hr);
-
-  // Endpoint section
-  for (const ep of ENDPOINTS) {
-    if (ep.section) {
-      const div = document.createElement('div');
-      div.className = 'section';
-      div.textContent = ep.section;
-      sidebar.appendChild(div);
-      continue;
+  if (currentTab === 'sequences') {
+    for (const seq of SEQUENCES) {
+      const btn = document.createElement('button');
+      btn.className = 'seq-btn';
+      btn.dataset.id = 'seq-' + seq.id;
+      btn.textContent = seq.title;
+      btn.onclick = () => selectSequence(seq);
+      sidebar.appendChild(btn);
     }
-    const btn = document.createElement('button');
-    btn.dataset.id = ep.id;
-    btn.innerHTML = `<span class="method ${ep.method.toLowerCase()}">${ep.method}</span>${ep.path}`;
-    btn.onclick = () => selectEndpoint(ep);
-    sidebar.appendChild(btn);
+  } else {
+    for (const ep of ENDPOINTS) {
+      if (ep.section) {
+        const div = document.createElement('div');
+        div.className = 'section';
+        div.textContent = ep.section;
+        sidebar.appendChild(div);
+        continue;
+      }
+      const btn = document.createElement('button');
+      btn.dataset.id = ep.id;
+      btn.innerHTML = `<span class="method ${ep.method.toLowerCase()}">${ep.method}</span>${ep.path}`;
+      btn.onclick = () => selectEndpoint(ep);
+      sidebar.appendChild(btn);
+    }
   }
 }
 
@@ -586,7 +639,7 @@ async function send() {
   if (ep.sse) return sendSSE(url, ep, badge, timing, t0);
 
   const sendBtn = document.getElementById('sendBtn');
-  sendBtn.disabled = true; sendBtn.textContent = '…';
+  sendBtn.disabled = true; sendBtn.textContent = '...';
 
   try {
     const opts = { method: ep.method, headers: { 'Content-Type': 'application/json' } };
@@ -765,7 +818,7 @@ function renderSequence(seq) {
       ${seq.steps.map((step, i) => `
         <div class="seq-step" id="seq-step-${i}" data-idx="${i}">
           <div class="seq-step-header" onclick="toggleStep(${i})">
-            <span class="seq-chevron">▶</span>
+            <span class="seq-chevron">&#9654;</span>
             <span class="seq-step-num">${i + 1}</span>
             <span class="seq-step-title">
               <span class="step-label">${esc(step.label)}</span>
@@ -792,11 +845,50 @@ function toggleStep(i) {
 }
 
 // Execute a single step, return { status, data, duration }
+function promptForInput(config) {
+  return new Promise((resolve) => {
+    const overlay = document.createElement('div');
+    overlay.className = 'modal-overlay';
+    overlay.innerHTML = `
+      <div class="modal">
+        <label>${esc(config.label)}</label>
+        <div class="modal-hint">This value will be sent as stdin to the running execution.</div>
+        <input type="text" id="modalInput" placeholder="${esc(config.placeholder || '')}" autofocus />
+        <div class="modal-actions">
+          <button class="btn" id="modalCancel">Cancel</button>
+          <button class="btn primary" id="modalSubmit">Send</button>
+        </div>
+      </div>
+    `;
+    document.body.appendChild(overlay);
+    const input = document.getElementById('modalInput');
+    const submit = () => {
+      const val = input.value;
+      overlay.remove();
+      resolve(val);
+    };
+    document.getElementById('modalSubmit').onclick = submit;
+    document.getElementById('modalCancel').onclick = () => { overlay.remove(); resolve(null); };
+    input.addEventListener('keydown', e => { if (e.key === 'Enter') { e.preventDefault(); submit(); } });
+    input.focus();
+  });
+}
+
 async function executeStep(step, signal) {
   const url = BASE + step.path;
   const t0 = performance.now();
 
   if (step.delay) await new Promise(r => setTimeout(r, step.delay));
+
+  // Prompt user for input if step requires it
+  if (step.promptInput) {
+    const value = await promptForInput(step.promptInput);
+    if (value === null) {
+      return { status: 0, data: 'Cancelled by user', duration: performance.now() - t0, cancelled: true };
+    }
+    const text = step.promptInput.appendNewline ? value + '\n' : value;
+    step.body = { ...step.body, [step.promptInput.bodyField]: text };
+  }
 
   if (step.sse) {
     // SSE execution
@@ -886,6 +978,15 @@ function renderStepResult(i, result) {
   const ms = Math.round(result.duration);
   timeEl.textContent = `${ms}ms`;
 
+  if (result.cancelled) {
+    statusEl.textContent = 'skipped';
+    statusEl.className = 'seq-step-status';
+    stepEl.classList.add('skipped');
+    const pretty = typeof result.data === 'string' ? result.data : JSON.stringify(result.data, null, 2);
+    responseEl.innerHTML = `<div class="detail-label">Response</div><pre>${esc(pretty)}</pre>`;
+    return;
+  }
+
   if (result.events) {
     // SSE result
     const statusClass = result.streaming ? 'sse-ok' : (result.status < 400 ? 's2xx' : 's4xx');
@@ -900,7 +1001,7 @@ function renderStepResult(i, result) {
       html += `<div class="sse-event"><span class="ev-type">${esc(ev.type)}</span><span class="ev-data">${esc(pretty)}</span></div>`;
     }
     if (result.streaming) {
-      html += `<div class="sse-event"><span class="ev-type" style="color:var(--muted)">…</span><span class="ev-data" style="color:var(--muted)">stream continues in background</span></div>`;
+      html += `<div class="sse-event"><span class="ev-type" style="color:var(--muted)">...</span><span class="ev-data" style="color:var(--muted)">stream continues in background</span></div>`;
     }
     html += '</div>';
     responseEl.innerHTML = html;
