@@ -38,13 +38,57 @@ py(code="name = input('Name: ')")  →  INPUT REQUESTED: "Name: "
 py(input="Alice")                   →  ✓ 50ms | 1 var
 ```
 
-### `py_look` — see state
+### `py_look` — see state, inspect, drill down, complete
 
+**Overview:**
 ```
-py_look()                          # overview + variable table
-py_look(at="df")                   # inspect a symbol
-py_look(at="math.sqrt")           # signature + docstring
-py_look(code="df.hea", cursor=6)  # completions at cursor
+py_look()
+→ python idle | 3 vars | exec #5
+
+  data   dict        {'name': 'Alice', 'scores': [90, 85, 92]}
+  x      int         42
+  model  Model       <Model object at 0x...>
+```
+
+**Inspect and drill down** — dot syntax navigates dicts, lists, and object attributes:
+```
+py_look(at="data")
+→ data: dict (3 items)
+    = {'name': 'Alice', 'scores': [90, 85, 92], 'info': {'age': 30}}
+
+      'name'    str   'Alice'
+    ▸ 'scores'  list  [90, 85, 92]
+    ▸ 'info'    dict  {'age': 30}
+
+py_look(at="data.scores")
+→ data.scores: list (3 items)
+    = [90, 85, 92]
+
+      [0]  int  90
+      [1]  int  85
+      [2]  int  92
+
+py_look(at="model")
+→ model: Model
+    = <Model object at 0x...>
+
+      lr      float  0.01
+    ▸ layers  list   [{'type': 'dense', ...}, ...]
+```
+
+`▸` marks expandable children — keep drilling with `py_look(at="model.layers.0")`.
+
+**Functions and modules:**
+```
+py_look(at="math.sqrt")
+→ math.sqrt: builtin_function_or_method (function)
+    Return the square root of x.
+```
+
+**Completions** — live from runtime state:
+```
+py_look(code="math.sq", cursor=7)
+→ sqrt  function  sqrt(x, /)
 ```
 
 ### `py_ctl` — control
@@ -123,9 +167,10 @@ app = create_app(cwd="/path/to/project")
 The same 3 tools serve notebook UIs through MCP:
 
 - **Real-time output**: `py` streams stdout/stderr as MCP logging notifications during execution
-- **Completions**: `py_look(code=buffer, cursor=pos)` returns typed completion items
+- **Completions**: `py_look(code=buffer, cursor=pos)` returns typed completion items on every keystroke
 - **Hover/inspect**: `py_look(at=symbol)` returns type, value, signature, docstring
-- **Variable explorer**: `py_look()` returns the full variable table
+- **Variable explorer**: `py_look()` returns the full variable table; `py_look(at="df")` drills into children with `▸` expandable markers
+- **Drill-down**: `py_look(at="data.scores.0")` navigates dicts, lists, and object attributes via dot syntax
 
 A notebook GUI is just an MCP client that listens to notifications for streaming and calls `py_look` for IDE features.
 
@@ -135,6 +180,7 @@ A notebook GUI is just an MCP client that listens to notifications for streaming
 - **Real-time streaming** — stdout/stderr via MCP notifications
 - **Live completions** — from actual runtime state, not just static analysis
 - **Symbol inspection** — type, value, signature, docstring, source location
+- **Variable drill-down** — navigate dicts, lists, objects via `py_look(at="data.scores.0")`
 - **Interactive input** — `input()` calls become `py(input="...")` responses
 - **Asset generation** — matplotlib figures, HTML output served at `/assets/{id}`
 - **Auto venv detection** — uses current venv or `VIRTUAL_ENV`
