@@ -2,257 +2,259 @@
 MRP MCP Server — the primary interface for mrmd-python.
 
 3 tools:
-- py:       run code or provide input
-- py_look:  see runtime state, variables, or inspect a symbol
+- py:       run code or provide input (streams stdout/stderr in real-time)
+- py_look:  see state, variables, inspect a symbol, or get completions
 - py_ctl:   reset or cancel
 
-That's it.
+Same tools serve both AI agents and notebook GUIs.
+- Agents read the compact text result.
+- GUIs listen to real-time logging notifications (stdout, stderr, display, asset).
+- GUIs call py_look(code=..., cursor=N) for completions.
 """
 
+import asyncio
 import json
 import re
 from contextlib import asynccontextmanager
 
-from fastmcp import FastMCP
+from fastmcp import FastMCP, Context
 
 from .service import RuntimeService
 
 
 # =============================================================================
-# Formatters — turn verbose dicts into compact text the LLM actually needs
+# Formatters
 # =============================================================================
 
 _ANSI_RE = re.compile(r"\x1b\[[0-9;]*[a-zA-Z]")
 
 
-def _strip_ansi(text: str) -> str:
-    return _ANSI_RE.sub("", text)
+def _strip_ansi(s: str) -> str:
+    return _ANSI_RE.sub("", s)
 
 
-def _clean(text: str | None) -> str:
-    if not text:
+def _clean(s: str | None) -> str:
+    if not s:
         return ""
-    s = _strip_ansi(text).replace("\r\n", "\n").replace("\r", "\n").strip()
-    # Strip IPython's "Out[N]: " prefix from expression results
-    s = re.sub(r"^Out\[\d+\]: ", "", s)
-    return s
+    s = _strip_ansi(s).replace("\r\n", "\n").replace("\r", "\n").strip()
+    return re.sub(r"^Out\[\d+\]: ", "", s)
 
 
-def _truncate(text: str, max_lines: int = 100) -> str:
-    lines = text.split("\n")
-    if len(lines) <= max_lines:
-        return text
-    keep = max_lines // 2
-    omitted = len(lines) - max_lines
-    return "\n".join(
-        lines[:keep]
-        + [f"… [{omitted} lines truncated] …"]
-        + lines[-keep:]
-    )
+def _truncate(s: str, n: int = 100) -> str:
+    lines = s.split("\n")
+    if len(lines) <= n:
+        return s
+    k = n // 2
+    return "\n".join(lines[:k] + [f"… [{len(lines) - n} lines truncated] …"] + lines[-k:])
 
 
-def _clip(text: str, max_chars: int = 200) -> str:
-    text = text.replace("\n", " ").strip()
-    if len(text) <= max_chars:
-        return text
-    return text[: max_chars - 15] + " … [truncated]"
+def _clip(s: str, n: int = 200) -> str:
+    s = s.replace("\n", " ").strip()
+    return s if len(s) <= n else s[: n - 15] + " … [truncated]"
 
 
 def _dedup(*blocks: str) -> str:
-    """Join non-empty blocks, skipping duplicates."""
     seen = set()
-    parts = []
+    out = []
     for b in blocks:
         b = b.strip()
         if b and b not in seen:
             seen.add(b)
-            parts.append(b)
-    return "\n".join(parts)
+            out.append(b)
+    return "\n".join(out)
 
 
-def _state_hint(result: dict) -> str:
-    """Build the ✓/✗ state hint line."""
-    success = result.get("success", True)
-    marker = "✓" if success else "✗"
+def _hint(result: dict) -> str:
+    ok = result.get("success", True)
     parts = []
-
-    duration = result.get("durationMs") or result.get("duration")
-    if duration is not None:
-        if duration < 1000:
-            parts.append(f"{duration}ms")
-        else:
-            parts.append(f"{duration / 1000:.1f}s")
-
-    var_count = result.get("_varCount")
-    if var_count is not None:
-        parts.append(f"{var_count} var{'s' if var_count != 1 else ''}")
-
-    assets = result.get("assets", [])
-    if assets:
-        n = len(assets)
-        parts.append(f"{n} asset{'s' if n != 1 else ''}")
-
-    return f"{marker} {' | '.join(parts)}" if parts else marker
+    ms = result.get("durationMs") or result.get("duration")
+    if ms is not None:
+        parts.append(f"{ms}ms" if ms < 1000 else f"{ms / 1000:.1f}s")
+    vc = result.get("_varCount")
+    if vc is not None:
+        parts.append(f"{vc} var{'s' if vc != 1 else ''}")
+    na = len(result.get("assets", []))
+    if na:
+        parts.append(f"{na} asset{'s' if na != 1 else ''}")
+    return ("✓ " if ok else "✗ ") + " | ".join(parts) if parts else ("✓" if ok else "✗")
 
 
-def format_run(result: dict) -> str:
-    """Format an execution result for the LLM."""
-    stdout = _clean(result.get("stdout"))
-    expr_result = _clean(result.get("result"))
-    stderr = _clean(result.get("stderr"))
-    error = result.get("error")
-
+def _fmt_run(r: dict) -> str:
+    stdout = _clean(r.get("stdout"))
+    expr = _clean(r.get("result"))
+    stderr = _clean(r.get("stderr"))
+    error = r.get("error")
     lines = []
 
     if error:
-        # On error: show condensed error, skip raw traceback from stdout
         if isinstance(error, dict):
-            err_type = error.get("type", "Error")
-            err_msg = error.get("message", "")
-            lines.append(f"{err_type}: {err_msg}")
-            err_line = error.get("line")
-            tb = error.get("traceback", [])
-            if err_line is not None:
-                # Find the offending code line in traceback
-                code_line = None
-                for t in reversed(tb):
+            lines.append(f"{error.get('type', 'Error')}: {error.get('message', '')}")
+            ln = error.get("line")
+            if ln is not None:
+                # Find offending code in traceback
+                for t in reversed(error.get("traceback", [])):
                     t = _strip_ansi(t).strip()
-                    if (t and not t.startswith("Traceback") and
-                            not t.startswith("File ") and
-                            not t.startswith("Cell ") and
-                            "Error" not in t and
-                            "--->" not in t and
-                            t != ""):
-                        code_line = t
+                    if (t and "Traceback" not in t and "File " not in t and
+                            "Cell " not in t and "Error" not in t and "--->" not in t):
+                        lines.append(f"  line {ln}: {t}")
                         break
-                if code_line:
-                    lines.append(f"  line {err_line}: {code_line}")
                 else:
-                    lines.append(f"  line {err_line}")
+                    lines.append(f"  line {ln}")
         else:
             lines.append(str(error))
     else:
-        # On success: show output
-        main = _dedup(stdout, expr_result)
+        main = _dedup(stdout, expr)
         if main:
             lines.append(_truncate(main))
-
-        # Stderr (only when no error)
         if stderr:
-            if lines:
-                lines.append("")
-            lines.append(f"STDERR: {_clip(stderr, 240)}")
+            lines.append(f"\nSTDERR: {_clip(stderr, 240)}" if lines else f"STDERR: {_clip(stderr, 240)}")
 
-    # State hint
+    for a in r.get("assets", []):
+        lines.append(f"[{a.get('assetType', 'file')}: {a.get('uri', '')}]")
+
     lines.append("")
-    lines.append(_state_hint(result))
-
+    lines.append(_hint(r))
     return "\n".join(lines)
 
 
-def format_input_requested(state: dict) -> str:
-    """Format an input_required response."""
-    ir = state.get("inputRequest", {})
-    prompt = ir.get("prompt", "")
-    lines = [
-        f'INPUT REQUESTED: "{prompt}"',
-        "",
-        "⏳ use py(input=\"...\") to continue",
-    ]
-    return "\n".join(lines)
+def _fmt_input(state: dict) -> str:
+    ir = state.get("inputRequest") or {}
+    return f'INPUT REQUESTED: "{ir.get("prompt", "")}"\n\n⏳ use py(input="...") to continue'
 
 
-def format_overview(health: dict, variables: dict) -> str:
-    """Format the default py_look() response."""
-    state = health.get("state", "?")
-    var_list = variables.get("variables", [])
-    exec_count = health.get("executionCount", 0)
-
-    lines = [f"python {state} | {len(var_list)} vars | exec #{exec_count}"]
-
-    if var_list:
+def _fmt_overview(health: dict, variables: dict) -> str:
+    vl = variables.get("variables", [])
+    lines = [f"python {health.get('state', '?')} | {len(vl)} vars | exec #{health.get('executionCount', 0)}"]
+    if vl:
         lines.append("")
-        # Find column widths
-        name_w = max(len(v.get("name", "")) for v in var_list[:25])
-        type_w = max(len(v.get("type", "")) for v in var_list[:25])
-        name_w = max(name_w, 4)
-        type_w = max(type_w, 4)
-
-        for v in var_list[:25]:
-            name = v.get("name", "")
-            vtype = v.get("type", "")
-            value = _clip(v.get("value", ""), 80)
-            lines.append(f"{name:<{name_w}}  {vtype:<{type_w}}  {value}")
-
-        if len(var_list) > 25:
-            lines.append(f"… {len(var_list) - 25} more")
+        nw = max((len(v.get("name", "")) for v in vl[:25]), default=4)
+        tw = max((len(v.get("type", "")) for v in vl[:25]), default=4)
+        for v in vl[:25]:
+            lines.append(f"{v['name']:<{max(nw,4)}}  {v.get('type',''):<{max(tw,4)}}  {_clip(v.get('value',''), 80)}")
+        if len(vl) > 25:
+            lines.append(f"… {len(vl) - 25} more")
     else:
-        lines.append("")
-        lines.append("No variables.")
-
+        lines += ["", "No variables."]
     return "\n".join(lines)
 
 
-def format_inspect(result: dict, symbol: str) -> str:
-    """Format a py_look(at=...) response."""
-    if not result.get("found"):
-        return f"{symbol}: not found in runtime namespace"
-
+def _fmt_inspect(r: dict, sym: str) -> str:
+    if not r.get("found"):
+        return f"{sym}: not found in runtime namespace"
     lines = []
-    name = result.get("name") or symbol
-    kind = result.get("kind") or ""
-    vtype = result.get("type") or ""
+    name = r.get("name") or sym
+    kind = r.get("kind") or ""
+    vtype = r.get("type") or ""
+    value = r.get("value") or ""
 
-    header = name
+    # Header: name: type
+    h = name
     if vtype:
-        header += f": {vtype}"
-    if kind and kind != vtype:
-        header += f" ({kind})"
-    lines.append(header)
+        h += f": {vtype}"
+    if kind and kind not in ("variable", vtype):
+        h += f" ({kind})"
+    lines.append(h)
 
-    sig = result.get("signature")
-    if sig:
-        lines.append(f"  {sig}")
+    # For variables, value is the most important thing
+    if kind == "variable" and value:
+        lines.append(f"  = {_clip(value, 300)}")
+    elif r.get("signature"):
+        lines.append(f"  {r['signature']}")
 
-    value = result.get("value")
-    if value:
-        lines.append(f"  Value: {_clip(value, 300)}")
+    # Shape/size metadata (useful for data science)
+    if r.get("shape"):
+        lines.append(f"  Shape: {r['shape']}")
+    if r.get("length") is not None:
+        lines.append(f"  Length: {r['length']}")
+    if r.get("size"):
+        lines.append(f"  Size: {r['size']}")
 
-    # Shape/size info from variable detail
-    shape = result.get("shape")
-    if shape:
-        lines.append(f"  Shape: {shape}")
+    # For non-variables (functions, classes), show value and location
+    if kind != "variable" and value:
+        lines.append(f"  Value: {_clip(value, 200)}")
+    if r.get("file"):
+        loc = r["file"]
+        if r.get("line"):
+            loc += f":{r['line']}"
+        lines.append(f"  Defined in: {loc}")
 
-    length = result.get("length")
-    if length is not None:
-        lines.append(f"  Length: {length}")
-
-    children = result.get("children")
-    if isinstance(children, int) and children > 0:
-        lines.append(f"  Children: {children}")
-
-    loc = result.get("file")
-    if loc:
-        line_num = result.get("line")
-        lines.append(f"  Defined in: {loc}{f':{line_num}' if line_num else ''}")
-
-    doc = result.get("docstring")
-    if doc:
-        lines.append("")
-        lines.append(_clip(doc, 500))
+    # Docstring — only for functions/methods/classes, not for simple variables
+    if r.get("docstring") and kind in ("function", "method", "class", "module", ""):
+        doc = r["docstring"]
+        # Skip very generic docstrings (like int.__doc__)
+        if kind not in ("variable",) or len(doc) < 200:
+            lines.append("")
+            lines.append(_clip(doc, 500))
 
     return "\n".join(lines)
 
 
-def format_reset(result: dict) -> str:
-    cleared = ", ".join(result.get("cleared", []))
-    var_count = 0  # after reset, always 0
-    return f"RESET | {cleared} cleared | {var_count} vars"
+def _fmt_completions(r: dict) -> str:
+    matches = r.get("matches", [])
+    if not matches:
+        return "No completions."
+    lw = max(len(m.get("label", "")) for m in matches[:20])
+    kw = max(len(m.get("kind", "")) for m in matches[:20])
+    lines = []
+    for m in matches[:20]:
+        lines.append(f"{m['label']:<{max(lw,4)}}  {m.get('kind',''):<{max(kw,4)}}  {m.get('detail') or m.get('type') or ''}")
+    if len(matches) > 20:
+        lines.append(f"… {len(matches) - 20} more")
+    return "\n".join(lines)
 
 
-def format_cancel(result: dict) -> str:
-    exec_id = result.get("execution", {}).get("executionId", "?")
-    return f"CANCELLED {exec_id}"
+# =============================================================================
+# Streaming helpers
+# =============================================================================
+
+async def _emit_event(ctx: Context, event):
+    """Send an execution event as an MCP logging notification."""
+    etype = event.type if hasattr(event, "type") else event.get("type")
+    content = event.content if hasattr(event, "content") else event.get("content")
+
+    if etype == "stdout" and content:
+        await ctx.info(_strip_ansi(content), logger_name="stdout")
+    elif etype == "stderr" and content:
+        await ctx.warning(_strip_ansi(content), logger_name="stderr")
+    elif etype == "display":
+        dd = event.displayData if hasattr(event, "displayData") else event.get("displayData")
+        if dd:
+            data = dd.data if hasattr(dd, "data") else dd.get("data", {})
+            mimes = list(data.keys()) if isinstance(data, dict) else []
+            await ctx.info(json.dumps({"display": mimes, "data": data}), logger_name="display")
+    elif etype == "asset":
+        asset = event.asset if hasattr(event, "asset") else event.get("asset")
+        if asset:
+            uri = asset.uri if hasattr(asset, "uri") else asset.get("uri", "")
+            atype = asset.assetType if hasattr(asset, "assetType") else asset.get("assetType", "file")
+            await ctx.info(f"[{atype}: {uri}]", logger_name="asset")
+    elif etype == "input_requested":
+        ir = event.inputRequest if hasattr(event, "inputRequest") else event.get("inputRequest")
+        if ir:
+            prompt = ir.prompt if hasattr(ir, "prompt") else ir.get("prompt", "")
+            await ctx.info(json.dumps({"input_requested": prompt}), logger_name="input")
+    elif etype == "warning":
+        w = event.warning if hasattr(event, "warning") else event.get("warning")
+        if w:
+            msg = w.message if hasattr(w, "message") else w.get("message", "")
+            await ctx.warning(msg, logger_name="runtime")
+
+
+async def _stream_until_done(service, execution, ctx):
+    """Poll execution, stream events, return when terminal or input_required."""
+    last_seq = 0
+    while not execution.is_terminal and execution.status != "input_required":
+        await asyncio.sleep(0.05)
+        new = execution.events[last_seq:]
+        for ev in new:
+            if ctx:
+                await _emit_event(ctx, ev)
+        last_seq = len(execution.events)
+
+    # Drain
+    for ev in execution.events[last_seq:]:
+        if ctx:
+            await _emit_event(ctx, ev)
 
 
 # =============================================================================
@@ -261,8 +263,10 @@ def format_cancel(result: dict) -> str:
 
 INSTRUCTIONS = (
     "Python runtime. "
-    "Use py to run code, py_look to see variables and inspect symbols, "
-    "py_ctl to reset or cancel."
+    "py(code) runs code. "
+    "py_look() shows variables. py_look(at='x') inspects x. "
+    "py_look(code='df.he', cursor=5) completes. "
+    "py_ctl(op='reset') resets."
 )
 
 
@@ -271,8 +275,6 @@ def create_mcp_server(
     name: str = "mrmd-python",
     **service_kwargs,
 ) -> FastMCP:
-    """Create the MCP server with 3 agent-friendly tools."""
-
     if service is None:
         service = RuntimeService(**service_kwargs)
 
@@ -287,110 +289,110 @@ def create_mcp_server(
 
     @mcp.resource("mrp://health")
     def health_resource() -> str:
-        """Runtime health and current state."""
         return json.dumps(service.get_health())
 
     @mcp.resource("mrp://capabilities")
     def capabilities_resource() -> str:
-        """Runtime capabilities and feature flags."""
         return json.dumps(service.get_capabilities())
 
-    # ── py: run code or provide input ────────────────────────
+    # ── py ───────────────────────────────────────────────────
 
     @mcp.tool
-    def py(
+    async def py(
         code: str | None = None,
         input: str | None = None,
         allow_input: bool = True,
+        ctx: Context = None,
     ) -> str:
         """Run Python code or provide input to a waiting execution.
 
         code: Python code to execute.
         input: Text to send to a waiting input() prompt.
-        allow_input: If false, input() calls fail instead of waiting (default true).
+        allow_input: If false, input() calls fail instead of waiting.
+
+        Streams stdout/stderr as real-time notifications.
         """
         if code and input:
             return "ERROR: provide either code or input, not both"
 
         if input is not None:
-            # Provide input to waiting execution
+            # ── provide input ──
             try:
-                status, data = service.provide_input_and_wait(input)
+                execution = service._current
+                if not execution or execution.is_terminal:
+                    return "ERROR: No active execution"
+                if execution.status != "input_required" or not execution.input_request:
+                    return "ERROR: No input request pending"
+
+                rid = execution.input_request.inputRequestId
+                service.provide_input(execution.execution_id, rid, input)
+                await _stream_until_done(service, execution, ctx)
+
+                if execution.status == "input_required":
+                    return _fmt_input(service.get_execution(execution.execution_id))
+                result = service.get_execution_result(execution.execution_id)
+                _enrich(service, result)
+                return _fmt_run(result)
             except Exception as e:
                 return f"ERROR: {e}"
-
-            if status == "input_required":
-                return format_input_requested(data)
-            else:
-                # Terminal — enrich with var count
-                _enrich_var_count(service, data)
-                return format_run(data)
 
         if not code:
             return "ERROR: provide code to execute"
 
-        # Execute code
+        # ── execute ──
         try:
-            status, data = service.execute_until_input_or_done(
-                code=code,
-                allow_input=allow_input,
-            )
+            accepted = service.start_execution(code=code, allow_input=allow_input)
         except RuntimeError as e:
             return f"ERROR: {e}"
 
-        if status == "input_required":
-            return format_input_requested(data)
-        else:
-            _enrich_var_count(service, data)
-            return format_run(data)
+        exec_id = accepted["execution"]["executionId"]
+        execution = service._executions[exec_id]
 
-    # ── py_look: see state, variables, or inspect ────────────
+        await _stream_until_done(service, execution, ctx)
+
+        if execution.status == "input_required":
+            return _fmt_input(service.get_execution(exec_id))
+
+        result = service.get_execution_result(exec_id)
+        _enrich(service, result)
+        return _fmt_run(result)
+
+    # ── py_look ──────────────────────────────────────────────
 
     @mcp.tool
-    def py_look(at: str | None = None) -> str:
-        """See runtime state, variables, or inspect a symbol.
+    def py_look(
+        at: str | None = None,
+        code: str | None = None,
+        cursor: int | None = None,
+    ) -> str:
+        """See runtime state, inspect a symbol, or get completions.
 
         No args: overview with variable list.
         at="df": inspect the symbol df.
         at="df.columns": drill into nested attribute.
+        code="df.hea" cursor=6: get completions at cursor position.
         """
-        if at is None:
-            # Overview: health + variable list
-            health = service.get_health()
+        # ── completions ──
+        if code is not None and cursor is not None:
             try:
-                variables = service.list_variables()
+                r = service.complete(code=code, cursor=cursor)
             except RuntimeError:
-                variables = {"variables": [], "count": 0, "truncated": False, "warnings": []}
-            return format_overview(health, variables)
+                r = {"matches": [], "cursorStart": cursor, "cursorEnd": cursor, "source": "runtime"}
+            return _fmt_completions(r)
 
-        # Inspect a symbol — try inspect first, fall back to hover
+        # ── inspect ──
+        if at is not None:
+            return _fmt_inspect(_do_inspect(service, at), at)
+
+        # ── overview ──
+        health = service.get_health()
         try:
-            result = service.inspect(code=at, cursor=len(at), detail=1)
-            if result.get("found"):
-                return format_inspect(result, at)
+            variables = service.list_variables()
         except RuntimeError:
-            pass
+            variables = {"variables": [], "count": 0}
+        return _fmt_overview(health, variables)
 
-        # Try hover
-        try:
-            result = service.hover(code=at, cursor=len(at))
-            if result.get("found"):
-                return format_inspect(result, at)
-        except RuntimeError:
-            pass
-
-        # Try variable detail if it looks like a name
-        if re.match(r"^[a-zA-Z_]\w*$", at):
-            try:
-                detail = service.get_variable(name=at)
-                if detail.get("name"):
-                    return format_inspect(detail, at)
-            except (RuntimeError, KeyError):
-                pass
-
-        return f"{at}: not found in runtime namespace"
-
-    # ── py_ctl: control ──────────────────────────────────────
+    # ── py_ctl ───────────────────────────────────────────────
 
     @mcp.tool
     def py_ctl(op: str, scope: str = "namespace") -> str:
@@ -402,31 +404,90 @@ def create_mcp_server(
         if op == "reset":
             scopes = ["namespace", "history", "assets"] if scope == "all" else [scope]
             try:
-                result = service.reset(scope=scopes)
-                return format_reset(result)
+                r = service.reset(scope=scopes)
+                return f"RESET | {', '.join(r.get('cleared', []))} cleared | 0 vars"
             except RuntimeError as e:
                 return f"ERROR: {e}"
-
         elif op == "cancel":
-            health = service.get_health()
-            exec_id = health.get("currentExecutionId")
-            if not exec_id:
+            eid = service.get_health().get("currentExecutionId")
+            if not eid:
                 return "No active execution."
             try:
-                result = service.cancel_execution(exec_id)
-                return format_cancel(result)
+                service.cancel_execution(eid)
+                return f"CANCELLED {eid}"
             except RuntimeError as e:
                 return f"ERROR: {e}"
-
         return f"ERROR: unknown op '{op}'. Use 'reset' or 'cancel'."
 
     return mcp
 
 
-def _enrich_var_count(service: RuntimeService, result: dict):
-    """Try to add variable count to result for the state hint."""
+def _do_inspect(service, symbol):
+    result = {"found": False}
+
+    # For simple names, try variable detail — gives value + type
+    if re.match(r"^[a-zA-Z_]\w*$", symbol):
+        try:
+            d = service.get_variable(name=symbol)
+            if d.get("name"):
+                d["found"] = True
+                d["kind"] = "variable"
+                result = d
+        except (RuntimeError, KeyError):
+            pass
+
+    # Also try inspect/hover — may give richer info (signature, docstring)
+    for fn in [
+        lambda: service.inspect(code=symbol, cursor=len(symbol), detail=1),
+        lambda: service.hover(code=symbol, cursor=len(symbol)),
+    ]:
+        try:
+            r = fn()
+            if r.get("found"):
+                # Merge: keep variable detail value, add inspect info
+                if result.get("found"):
+                    for key in ("signature", "docstring", "sourceCode", "file", "line"):
+                        if r.get(key) and not result.get(key):
+                            result[key] = r[key]
+                    if r.get("kind") and r["kind"] != "variable":
+                        result["kind"] = r["kind"]
+                else:
+                    result = r
+                break
+        except RuntimeError:
+            pass
+
+    # If we didn't find anything or got "<not found>", try list_variables
+    if (not result.get("found") or
+            result.get("value") == "<not found>" or
+            result.get("type") == "unknown"):
+        if re.match(r"^[a-zA-Z_]\w*$", symbol):
+            try:
+                vl = service.list_variables()
+                for v in vl.get("variables", []):
+                    if v.get("name") == symbol:
+                        result["found"] = True
+                        result["kind"] = "variable"
+                        result["name"] = v["name"]
+                        result["value"] = v.get("value", result.get("value"))
+                        result["type"] = v.get("type", result.get("type"))
+                        for k in ("size", "shape", "dtype", "length", "keys", "expandable"):
+                            if v.get(k) is not None:
+                                result[k] = v[k]
+                        break
+            except RuntimeError:
+                pass
+
+    # Clean up residual "<not found>"
+    if result.get("value") == "<not found>":
+        result.pop("value", None)
+
+    return result
+
+
+def _enrich(service, result):
     try:
-        variables = service.list_variables()
-        result["_varCount"] = variables.get("count", len(variables.get("variables", [])))
+        v = service.list_variables()
+        result["_varCount"] = v.get("count", len(v.get("variables", [])))
     except Exception:
         pass
