@@ -99,64 +99,83 @@ py_ctl(op="reset", scope="all")   # clear everything
 py_ctl(op="cancel")               # cancel running execution
 ```
 
-## Installation
+## Install
 
 ```bash
 uv pip install mrmd-python
 ```
 
-## Usage
-
-### As an MCP server (STDIO)
+## Start
 
 ```bash
-# With FastMCP CLI
-fastmcp run mrmd_python.mcp_server:create_mcp_server
-
-# Or directly
-python -c "from mrmd_python.mcp_server import create_mcp_server; create_mcp_server().run()"
+mrmd-python                  # MCP over stdio (default)
+mrmd-python --http           # MCP over HTTP
+mrmd-python --cwd ~/project  # specific project directory
+mrmd-python --venv ~/p/.venv # specific virtual environment
+mrmd-python install          # show config for Claude Desktop / Cursor / mcp2cli
 ```
 
-### As an HTTP server
+Default is **stdio** — exactly what MCP hosts expect. Auto-detects venv from current directory.
+
+## Connect
+
+### Claude Desktop
+
+Add to your Claude Desktop config (`~/Library/Application Support/Claude/claude_desktop_config.json`):
+
+```json
+{
+  "mcpServers": {
+    "python": {
+      "command": "uvx",
+      "args": ["mrmd-python", "--cwd", "/path/to/your/project"]
+    }
+  }
+}
+```
+
+Or run `mrmd-python install` to generate the config for your current directory.
+
+### Cursor
+
+Add to `.cursor/mcp.json`:
+
+```json
+{
+  "mcpServers": {
+    "python": {
+      "command": "uvx",
+      "args": ["mrmd-python"]
+    }
+  }
+}
+```
+
+### mcp2cli
 
 ```bash
-python -m mrmd_python --port 8000
+mcp2cli add python --command 'mrmd-python --cwd .'
+mcp2cli tool python py --code 'print("hello")'
+mcp2cli tool python py_look
 ```
 
-Serves:
-- `/mcp-server/mcp` — MCP Streamable HTTP endpoint
-- `/health` — plain HTTP health check
-- `/assets/{id}` — runtime-generated assets (plots, HTML)
-
-### With mcp2cli
+### MCP Inspector
 
 ```bash
-mcp2cli add mrmd-python --command 'fastmcp run mrmd_python.mcp_server:create_mcp_server'
-mcp2cli tool mrmd-python py --code 'print("hello")'
-mcp2cli tool mrmd-python py_look
+mrmd-python --http --port 8000
+# Inspector → Transport: Streamable HTTP → URL: http://127.0.0.1:8000/mcp-server/mcp
 ```
-
-### With MCP Inspector
-
-1. Start the HTTP server: `python -m mrmd_python --port 8000`
-2. In Inspector, set Transport Type to **Streamable HTTP**
-3. URL: `http://127.0.0.1:8000/mcp-server/mcp`
-4. Connect
 
 ### Programmatic
 
 ```python
-from mrmd_python import create_mcp_server, RuntimeService
+from mrmd_python import create_mcp_server
 
-# Create and run
+# STDIO (for MCP hosts)
 mcp = create_mcp_server()
-mcp.run()  # STDIO
+mcp.run()
 
-# Or with a shared service
-service = RuntimeService(cwd="/path/to/project")
-mcp = create_mcp_server(service=service)
-
-# Or as a FastAPI app
+# HTTP
 from mrmd_python import create_app
 app = create_app(cwd="/path/to/project")
 # uvicorn.run(app, host="127.0.0.1", port=8000)
