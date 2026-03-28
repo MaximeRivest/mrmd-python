@@ -775,6 +775,13 @@ class MRPServer:
         content_type = content_types.get(suffix, "application/octet-stream")
         return FileResponse(full_path, media_type=content_type)
 
+    async def handle_playground(self, request: Request) -> Response:
+        """Serve the interactive API playground."""
+        playground_path = Path(__file__).parent / "playground.html"
+        if not playground_path.exists():
+            return JSONResponse({"error": "playground not found"}, status_code=404)
+        return FileResponse(playground_path, media_type="text/html")
+
     def create_routes(self) -> list[Route]:
         """Create all routes."""
         return [
@@ -795,6 +802,7 @@ class MRPServer:
             Route("/mrp/v1/format", self.handle_format, methods=["POST"]),
             Route("/mrp/v1/history", self.handle_history, methods=["POST"]),
             Route("/mrp/v1/assets/{id}", self.handle_asset, methods=["GET"]),
+            Route("/mrp/v1/playground", self.handle_playground, methods=["GET"]),
         ]
 
 

@@ -227,6 +227,9 @@ Runtime '{info['id']}' started:
   venv: {info['venv']}
   cwd:  {info['cwd']}
 
+Playground:
+  {info['url']}/playground
+
 Management:
   mrmd-python --list          List all runtimes
   mrmd-python --info {info['id']:<8} Get runtime info

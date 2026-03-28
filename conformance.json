@@ -1,0 +1,30 @@
+{
+  "name": "mrmd-python",
+  "profile": "python",
+  "start": {
+    "cwd": ".",
+    "command": [
+      "uv",
+      "run",
+      "--project",
+      ".",
+      "python",
+      "-m",
+      "mrmd_python",
+      "--foreground",
+      "--managed",
+      "--host",
+      "127.0.0.1",
+      "--port",
+      "{port}"
+    ],
+    "env": {
+      "PYTHONUNBUFFERED": "1"
+    }
+  },
+  "timeouts": {
+    "startupMs": 20000,
+    "requestMs": 10000,
+    "longRunningMs": 15000
+  }
+}

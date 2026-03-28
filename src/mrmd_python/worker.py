@@ -82,6 +82,7 @@ class IPythonWorker:
         self._captured_displays: list[dict] = []
         self._asset_counter = 0
         self._interrupt_requested = False
+        self._executing_thread_id: int | None = None  # Thread ID for interrupt
 
         # Set matplotlib backend to Agg early (before any imports)
         # This ensures plots work even if matplotlib is installed later via %pip
@@ -779,6 +780,7 @@ class IPythonWorker:
         start_time = time.time()
         result = ExecuteResult()
 
+        self._executing_thread_id = threading.get_ident()
         try:
             # Ensure matplotlib hook is applied BEFORE execution
             # (handles case where matplotlib was installed via %pip)
@@ -846,6 +848,7 @@ class IPythonWorker:
             result.stderr = captured_stderr.getvalue()
             result.duration = int((time.time() - start_time) * 1000)
             self._current_exec_id = None
+            self._executing_thread_id = None
 
         return result
 
@@ -982,6 +985,8 @@ class IPythonWorker:
         )
 
         result = ExecuteResult()
+
+        self._executing_thread_id = threading.get_ident()
 
         # Hook builtins.input for stdin support
         import builtins
@@ -1155,6 +1160,7 @@ class IPythonWorker:
             result.stderr = "".join(accumulated_stderr)
             result.duration = int((time.time() - start_time) * 1000)
             self._current_exec_id = None
+            self._executing_thread_id = None
 
         return result
 
@@ -2124,17 +2130,32 @@ class IPythonWorker:
         """Interrupt currently running code.
 
         For subprocess workers, sends SIGINT.
-        For local execution, sets interrupt flag (checked in callbacks).
+        For local execution, raises KeyboardInterrupt in the executing thread.
 
         Returns True if interrupt was initiated.
         """
         if self._subprocess_worker is not None:
             return self._subprocess_worker.interrupt()
 
-        # For local execution, set the interrupt flag
-        # This will be checked by long-running operations
-        self._interrupt_requested = True
-        return True
+        # For local execution, raise KeyboardInterrupt in the executing thread
+        thread_id = self._executing_thread_id
+        if thread_id is not None:
+            import ctypes
+            res = ctypes.pythonapi.PyThreadState_SetAsyncExc(
+                ctypes.c_ulong(thread_id),
+                ctypes.py_object(KeyboardInterrupt),
+            )
+            if res == 1:
+                return True
+            elif res > 1:
+                # "If it returns a number greater than one, you're in trouble,
+                # and you should call it again with exc=NULL to revert the effect"
+                ctypes.pythonapi.PyThreadState_SetAsyncExc(
+                    ctypes.c_ulong(thread_id), None
+                )
+            return False
+
+        return False
 
     def get_info(self) -> dict:
         """Get info about this worker."""

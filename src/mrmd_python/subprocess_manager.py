@@ -196,8 +196,7 @@ class SubprocessWorker:
                 "storeHistory": store_history,
                 "execId": exec_id,
                 "allowStdin": allow_stdin,
-            }) + "
-")
+            }) + "\n")
             self._process.stdin.flush()
 
             accumulated_stdout = ""
@@ -232,8 +231,7 @@ class SubprocessWorker:
                         error=ExecuteError(
                             type="SubprocessError",
                             message=response.get("error", "Unknown error"),
-                            traceback=response.get("traceback", "").split("
-") if response.get("traceback") else [],
+                            traceback=response.get("traceback", "").split("\n") if response.get("traceback") else [],
                         ),
                     )
 

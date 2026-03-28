@@ -1,0 +1,1055 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>MRP Playground</title>
+<style>
+  :root {
+    --bg: #0d1117; --surface: #161b22; --border: #30363d;
+    --text: #e6edf3; --muted: #8b949e; --accent: #58a6ff;
+    --green: #3fb950; --red: #f85149; --yellow: #d29922;
+    --font: 'SF Mono', 'Cascadia Code', 'Fira Code', monospace;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: var(--font); background: var(--bg); color: var(--text); font-size: 13px; }
+
+  header {
+    display: flex; align-items: center; gap: 16px; padding: 12px 20px;
+    border-bottom: 1px solid var(--border); background: var(--surface);
+  }
+  header h1 { font-size: 16px; font-weight: 600; }
+  header .status { display: flex; align-items: center; gap: 6px; font-size: 12px; color: var(--muted); }
+  header .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--muted); }
+  header .dot.ok { background: var(--green); }
+  header .dot.dead { background: var(--red); }
+  header .runtime-info { margin-left: auto; font-size: 11px; color: var(--muted); }
+
+  .container { display: flex; height: calc(100vh - 49px); }
+
+  /* Sidebar */
+  nav {
+    width: 220px; min-width: 220px; border-right: 1px solid var(--border);
+    background: var(--surface); overflow-y: auto; padding: 8px 0;
+  }
+  nav .section { padding: 6px 16px; font-size: 10px; text-transform: uppercase;
+    letter-spacing: 0.5px; color: var(--muted); margin-top: 8px; }
+  nav button {
+    display: flex; align-items: center; gap: 8px; width: 100%;
+    padding: 6px 16px; background: none; border: none; color: var(--text);
+    font: inherit; font-size: 12px; cursor: pointer; text-align: left;
+  }
+  nav button:hover { background: rgba(88,166,255,0.1); }
+  nav button.active { background: rgba(88,166,255,0.15); color: var(--accent); }
+  nav .method {
+    font-size: 10px; font-weight: 700; padding: 1px 4px; border-radius: 3px;
+    min-width: 32px; text-align: center;
+  }
+  nav .method.get { background: rgba(63,185,80,0.2); color: var(--green); }
+  nav .method.post { background: rgba(88,166,255,0.2); color: var(--accent); }
+
+  /* Main */
+  main { flex: 1; display: flex; flex-direction: column; overflow: hidden; }
+
+  .endpoint-header {
+    padding: 16px 20px; border-bottom: 1px solid var(--border);
+    display: flex; align-items: baseline; gap: 12px;
+  }
+  .endpoint-header h2 { font-size: 14px; font-weight: 600; }
+  .endpoint-header .path { color: var(--muted); font-size: 12px; }
+  .endpoint-header .desc { color: var(--muted); font-size: 11px; margin-left: auto; }
+
+  .panels { display: flex; flex: 1; overflow: hidden; }
+  .panel { flex: 1; display: flex; flex-direction: column; overflow: hidden; }
+  .panel + .panel { border-left: 1px solid var(--border); }
+  .panel-header {
+    padding: 8px 16px; font-size: 11px; text-transform: uppercase;
+    letter-spacing: 0.5px; color: var(--muted); border-bottom: 1px solid var(--border);
+    background: var(--surface); display: flex; align-items: center; gap: 8px;
+  }
+  .panel-header .badge {
+    padding: 1px 6px; border-radius: 3px; font-size: 10px;
+    font-weight: 600; text-transform: none; letter-spacing: 0;
+  }
+  .badge.s200 { background: rgba(63,185,80,0.2); color: var(--green); }
+  .badge.s4xx { background: rgba(248,81,73,0.2); color: var(--red); }
+  .badge.s5xx { background: rgba(248,81,73,0.2); color: var(--red); }
+  .badge.sse { background: rgba(210,153,34,0.2); color: var(--yellow); }
+
+  textarea {
+    flex: 1; background: var(--bg); color: var(--text); border: none;
+    font: inherit; font-size: 12px; padding: 12px 16px; resize: none; outline: none;
+    tab-size: 2;
+  }
+  pre.response {
+    flex: 1; background: var(--bg); color: var(--text); padding: 12px 16px;
+    overflow: auto; font-size: 12px; white-space: pre-wrap; word-break: break-word;
+  }
+
+  .toolbar {
+    padding: 8px 16px; border-top: 1px solid var(--border);
+    display: flex; gap: 8px; align-items: center;
+  }
+  .btn {
+    padding: 5px 14px; border-radius: 6px; border: 1px solid var(--border);
+    background: var(--surface); color: var(--text); font: inherit; font-size: 12px;
+    cursor: pointer;
+  }
+  .btn:hover { border-color: var(--accent); }
+  .btn.primary { background: rgba(88,166,255,0.15); border-color: var(--accent); color: var(--accent); }
+  .btn.danger { background: rgba(248,81,73,0.1); border-color: var(--red); color: var(--red); }
+  .toolbar .spacer { flex: 1; }
+  .toolbar .time { font-size: 11px; color: var(--muted); }
+
+  /* SSE log */
+  .sse-log { flex: 1; overflow: auto; background: var(--bg); padding: 4px 0; }
+  .sse-event {
+    padding: 2px 16px; font-size: 12px; border-bottom: 1px solid rgba(48,54,61,0.3);
+  }
+  .sse-event .ev-type { color: var(--yellow); font-weight: 600; margin-right: 8px; }
+  .sse-event .ev-data { color: var(--text); }
+
+  /* Variable tree */
+  .var-tree { flex: 1; overflow: auto; padding: 8px 0; }
+  .var-row {
+    padding: 3px 16px; font-size: 12px; display: flex; gap: 12px; cursor: pointer;
+  }
+  .var-row:hover { background: rgba(88,166,255,0.06); }
+  .var-name { color: var(--accent); min-width: 120px; }
+  .var-type { color: var(--muted); min-width: 80px; }
+  .var-value { color: var(--text); flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .var-children { padding-left: 20px; }
+
+  /* URL bar */
+  .url-bar {
+    padding: 8px 16px; background: var(--surface); border-bottom: 1px solid var(--border);
+    display: flex; gap: 8px; align-items: center; font-size: 12px;
+  }
+  .url-bar input {
+    flex: 1; background: var(--bg); border: 1px solid var(--border); border-radius: 4px;
+    color: var(--text); font: inherit; padding: 4px 8px;
+  }
+  .url-bar input:focus { outline: none; border-color: var(--accent); }
+
+  .hidden { display: none !important; }
+
+  /* Sequences */
+  nav button.seq-btn {
+    padding-left: 12px; font-size: 11px; line-height: 1.4;
+  }
+  nav button.seq-btn .seq-icon { font-size: 13px; min-width: 20px; text-align: center; }
+
+  .seq-header {
+    padding: 16px 20px; border-bottom: 1px solid var(--border);
+  }
+  .seq-header h2 { font-size: 14px; font-weight: 600; margin-bottom: 4px; }
+  .seq-header p { font-size: 12px; color: var(--muted); line-height: 1.5; }
+
+  .seq-controls {
+    padding: 8px 20px; border-bottom: 1px solid var(--border);
+    display: flex; gap: 8px; align-items: center; background: var(--surface);
+  }
+  .seq-controls .progress-text { font-size: 11px; color: var(--muted); margin-left: auto; }
+
+  .seq-timeline {
+    flex: 1; overflow: auto; padding: 0;
+  }
+
+  .seq-step {
+    border-bottom: 1px solid var(--border);
+  }
+  .seq-step-header {
+    display: flex; align-items: center; gap: 10px; padding: 10px 20px;
+    cursor: pointer; user-select: none;
+  }
+  .seq-step-header:hover { background: rgba(88,166,255,0.04); }
+  .seq-step-num {
+    width: 22px; height: 22px; border-radius: 50%; display: flex; align-items: center;
+    justify-content: center; font-size: 11px; font-weight: 700; flex-shrink: 0;
+    background: var(--border); color: var(--muted);
+  }
+  .seq-step.done .seq-step-num { background: rgba(63,185,80,0.2); color: var(--green); }
+  .seq-step.fail .seq-step-num { background: rgba(248,81,73,0.2); color: var(--red); }
+  .seq-step.running .seq-step-num { background: rgba(88,166,255,0.2); color: var(--accent); }
+  .seq-step.skipped .seq-step-num { background: var(--border); color: var(--muted); opacity: 0.5; }
+  .seq-step-title {
+    flex: 1; font-size: 12px;
+  }
+  .seq-step-title .step-label { font-weight: 600; }
+  .seq-step-title .step-desc { color: var(--muted); margin-left: 8px; }
+  .seq-step-method {
+    font-size: 10px; font-weight: 700; padding: 1px 4px; border-radius: 3px;
+  }
+  .seq-step-method.get { background: rgba(63,185,80,0.2); color: var(--green); }
+  .seq-step-method.post { background: rgba(88,166,255,0.2); color: var(--accent); }
+  .seq-step-time { font-size: 11px; color: var(--muted); min-width: 50px; text-align: right; }
+  .seq-step-status { font-size: 10px; font-weight: 600; padding: 1px 6px; border-radius: 3px; }
+  .seq-step-status.s2xx { background: rgba(63,185,80,0.15); color: var(--green); }
+  .seq-step-status.s4xx { background: rgba(248,81,73,0.15); color: var(--red); }
+  .seq-step-status.sse-ok { background: rgba(210,153,34,0.15); color: var(--yellow); }
+
+  .seq-step-detail {
+    display: none; padding: 0 20px 12px 52px;
+  }
+  .seq-step.expanded .seq-step-detail { display: block; }
+  .seq-step-detail .detail-section { margin-bottom: 8px; }
+  .seq-step-detail .detail-label {
+    font-size: 10px; text-transform: uppercase; letter-spacing: 0.5px;
+    color: var(--muted); margin-bottom: 2px;
+  }
+  .seq-step-detail pre {
+    background: var(--bg); border: 1px solid var(--border); border-radius: 4px;
+    padding: 8px 10px; font-size: 11px; overflow-x: auto; white-space: pre-wrap;
+    word-break: break-word; max-height: 300px; overflow-y: auto;
+  }
+  .seq-step-detail .step-comment {
+    font-size: 11px; color: var(--muted); font-style: italic;
+    padding: 4px 0; line-height: 1.5;
+  }
+  .seq-step-detail .sse-events {
+    background: var(--bg); border: 1px solid var(--border); border-radius: 4px;
+    padding: 4px 0; max-height: 300px; overflow-y: auto;
+  }
+  .seq-step-detail .sse-events .sse-event { padding: 1px 10px; font-size: 11px; }
+
+  /* Chevron */
+  .seq-chevron { font-size: 10px; color: var(--muted); transition: transform 0.15s; }
+  .seq-step.expanded .seq-chevron { transform: rotate(90deg); }
+
+  /* Toast */
+  .toast {
+    position: fixed; bottom: 20px; right: 20px; padding: 8px 16px;
+    background: var(--surface); border: 1px solid var(--border); border-radius: 6px;
+    font-size: 12px; z-index: 100; opacity: 0; transition: opacity 0.3s;
+  }
+  .toast.show { opacity: 1; }
+</style>
+</head>
+<body>
+
+<header>
+  <h1>MRP Playground</h1>
+  <div class="status"><div class="dot" id="statusDot"></div><span id="statusText">connecting…</span></div>
+  <div class="runtime-info" id="runtimeInfo"></div>
+</header>
+
+<div class="container">
+  <nav id="sidebar"></nav>
+  <main id="main"></main>
+</div>
+
+<div class="toast" id="toast"></div>
+
+<script>
+// --- Config ---
+const BASE = (() => {
+  const params = new URLSearchParams(location.search);
+  if (params.has('url')) return params.get('url').replace(/\/$/, '');
+  // If served from the runtime itself, use same origin
+  if (location.pathname.startsWith('/mrp/')) return location.origin + '/mrp/v1';
+  return 'http://localhost:39885/mrp/v1';
+})();
+
+// --- Sequence definitions ---
+const SEQUENCES = [
+  {
+    id: 'connect',
+    icon: '',
+    title: 'Connect & Discover',
+    desc: 'The first thing any client does: check the runtime is alive, discover capabilities, and adapt the UI.',
+    steps: [
+      { label: 'Health check', desc: 'Is the runtime alive?', method: 'GET', path: '/health',
+        comment: 'Poll this periodically (every 5-10s). If it fails, the runtime is dead.' },
+      { label: 'Capabilities', desc: 'What can this runtime do?', method: 'GET', path: '/capabilities',
+        comment: 'Cache this — it won\'t change. Use features to show/hide UI (variable explorer, format button, etc.).' },
+    ]
+  },
+  {
+    id: 'basic-exec',
+    icon: '',
+    title: 'Execute & Inspect State',
+    desc: 'Run code, then inspect the resulting namespace — the core notebook loop.',
+    steps: [
+      { label: 'Reset namespace', desc: 'Start clean', method: 'POST', path: '/reset',
+        body: { scope: ['namespace'] },
+        comment: 'Optional — ensures a clean slate for the demo.' },
+      { label: 'Execute code', desc: 'Define some variables', method: 'POST', path: '/execute',
+        body: { code: 'import math\n\nname = "Alice"\nscores = [95, 87, 92, 78, 88]\naverage = sum(scores) / len(scores)\npi_approx = round(math.pi, 4)', storeHistory: true, execId: 'seq-exec-1' },
+        comment: 'Synchronous execute — waits for completion. Good for short code.' },
+      { label: 'List variables', desc: 'What\'s in the namespace now?', method: 'POST', path: '/variables',
+        body: { filter: { excludePrivate: true }, maxValueLength: 200 },
+        comment: 'Shows all user variables. The runtime knows actual values, not just type hints.' },
+      { label: 'Drill into list', desc: 'Expand the scores variable', method: 'POST', path: '/variables/scores',
+        body: { path: [], maxChildren: 50 },
+        comment: 'variableExpand — drill into objects to see children, attributes, methods.' },
+      { label: 'Hover on symbol', desc: 'Quick tooltip for average', method: 'POST', path: '/hover',
+        body: { code: 'average', cursor: 7 },
+        comment: 'Lightweight inspect — shows type and value preview. Great for inline tooltips.' },
+      { label: 'Check history', desc: 'What was executed?', method: 'POST', path: '/history',
+        body: { n: 10 },
+        comment: 'History tracks inputs. Useful for up-arrow navigation and session replay.' },
+    ]
+  },
+  {
+    id: 'streaming',
+    icon: '',
+    title: 'Streaming Execution',
+    desc: 'Execute long-running code with SSE streaming — see output as it happens.',
+    steps: [
+      { label: 'Stream execution', desc: 'Loop with live output', method: 'POST', path: '/execute/stream', sse: true,
+        body: { code: 'import time\nfor i in range(5):\n    print(f"Processing batch {i+1}/5...")\n    time.sleep(0.4)\nprint("\\nAll batches complete!")\nresult = 5 * 42', storeHistory: true, allowStdin: false, execId: 'seq-stream-1' },
+        comment: 'SSE stream: start → stdout chunks → result → done. Client shows output progressively.' },
+      { label: 'Check state after', desc: 'Verify result was stored', method: 'POST', path: '/hover',
+        body: { code: 'result', cursor: 6 },
+        comment: 'State persists after streaming execution, same as sync execute.' },
+    ]
+  },
+  {
+    id: 'interrupt',
+    icon: '',
+    title: 'Interrupt & Conflict',
+    desc: 'What happens when you try to execute while something is already running? How to interrupt.',
+    steps: [
+      { label: 'Start long execution', desc: 'Kicks off a 30s sleep', method: 'POST', path: '/execute/stream', sse: true, noWait: true,
+        body: { code: 'import time\nprint("Starting long computation...")\ntime.sleep(30)\nprint("Done!")', storeHistory: false, allowStdin: false, execId: 'seq-long-1' },
+        comment: 'This starts streaming but we won\'t wait for it to finish.' },
+      { label: 'Attempt second execute', desc: 'Should get 409 Conflict', method: 'POST', path: '/execute',
+        body: { code: 'print("Can I run?")', execId: 'seq-conflict-1' }, expectStatus: 409, delay: 500,
+        comment: '409 Conflict — one execution at a time. Client decides: queue, interrupt, or discard.' },
+      { label: 'Check health', desc: 'Runtime reports executing state', method: 'GET', path: '/health',
+        comment: 'state: "executing", currentExecId shows what\'s running.' },
+      { label: 'Interrupt', desc: 'Cancel the running execution', method: 'POST', path: '/interrupt',
+        body: {},
+        comment: 'Always available during execution. The streamed execution will get a KeyboardInterrupt.' },
+      { label: 'Health after interrupt', desc: 'Should be idle again', method: 'GET', path: '/health', delay: 300,
+        comment: 'Back to idle. Ready for the next execution.' },
+    ]
+  },
+  {
+    id: 'completions',
+    icon: '',
+    title: 'Runtime Completions',
+    desc: 'Completions powered by live runtime state — knows actual variable values and types.',
+    steps: [
+      { label: 'Set up namespace', desc: 'Create a dict to complete on', method: 'POST', path: '/execute',
+        body: { code: 'class Config:\n    host = "localhost"\n    port = 8080\n    debug = True\n    max_retries = 3\n\nconfig = Config()', storeHistory: true, execId: 'seq-comp-setup' },
+        comment: 'First we need state in the namespace for runtime completions to work.' },
+      { label: 'Complete config.', desc: 'Dot-triggered completion', method: 'POST', path: '/complete',
+        body: { code: 'config.', cursor: 7, triggerKind: 'character', triggerCharacter: '.' },
+        comment: 'Runtime completions know config is a Config instance — returns actual attributes with values.' },
+      { label: 'Inspect config.host', desc: 'Get full details', method: 'POST', path: '/inspect',
+        body: { code: 'config.host', cursor: 11, detail: 1 },
+        comment: 'Detailed info: type, value, docstring, source. detail=1 includes docs.' },
+      { label: 'Complete builtin', desc: 'Completions on import', method: 'POST', path: '/complete',
+        body: { code: 'import os\nos.path.join', cursor: 19, triggerKind: 'invoked' },
+        comment: 'Also works on imported modules — runtime has actually imported os.' },
+    ]
+  },
+  {
+    id: 'error-handling',
+    icon: '',
+    title: 'Errors & Code Analysis',
+    desc: 'How errors are reported, and how to check code validity before executing.',
+    steps: [
+      { label: 'Check incomplete code', desc: 'Open function block', method: 'POST', path: '/is_complete',
+        body: { code: 'def greet(name):' },
+        expectStatus: 200,
+        comment: 'status: "incomplete" — needs more input. Useful for multiline editors.' },
+      { label: 'Check complete code', desc: 'Finished statement', method: 'POST', path: '/is_complete',
+        body: { code: 'def greet(name):\n    return f"Hello, {name}!"\n' },
+        comment: 'status: "complete" — safe to execute.' },
+      { label: 'Check invalid code', desc: 'Syntax error', method: 'POST', path: '/is_complete',
+        body: { code: 'def greet(\n' },
+        comment: 'status: "invalid" or "incomplete" — IPython may see the open paren as incomplete rather than invalid.' },
+      { label: 'Execute with error', desc: 'NameError at runtime', method: 'POST', path: '/execute',
+        body: { code: 'print(undefined_variable)', storeHistory: true, execId: 'seq-err-1' },
+        comment: 'success: false, error has type, message, traceback, and line/column info.' },
+      { label: 'Format messy code', desc: 'Auto-format with black', method: 'POST', path: '/format',
+        body: { code: 'x=1+2;y={   "a":1,   "b"  : [  1,2,3  ]  };z=x+len( y )' },
+        comment: 'Pure code transformation — no execution involved.' },
+    ]
+  },
+  {
+    id: 'rich-output',
+    icon: '',
+    title: 'Rich Output & Assets',
+    desc: 'Display data with HTML tables, and generate plot assets served via /assets/{id}.',
+    steps: [
+      { label: 'HTML display', desc: 'Rich mimebundle output', method: 'POST', path: '/execute',
+        body: { code: 'from IPython.display import HTML, display\n\ntable = """<table style="border-collapse:collapse">\n<tr style="background:#264f78"><th style="padding:6px 12px;color:white">Name</th><th style="padding:6px 12px;color:white">Score</th></tr>\n<tr><td style="padding:4px 12px;border:1px solid #444">Alice</td><td style="padding:4px 12px;border:1px solid #444">95</td></tr>\n<tr style="background:#1a1a2e"><td style="padding:4px 12px;border:1px solid #444">Bob</td><td style="padding:4px 12px;border:1px solid #444">87</td></tr>\n<tr><td style="padding:4px 12px;border:1px solid #444">Carol</td><td style="padding:4px 12px;border:1px solid #444">92</td></tr>\n</table>"""\ndisplay(HTML(table))', storeHistory: true, execId: 'seq-rich-1' },
+        comment: 'displayData array contains mimebundles (text/html, text/plain, image/png, etc.). Client renders richest format.' },
+      { label: 'Matplotlib plot', desc: 'Generate a figure asset', method: 'POST', path: '/execute',
+        body: { code: 'import matplotlib\nmatplotlib.use("Agg")\nimport matplotlib.pyplot as plt\nimport math\n\nx = [i/10 for i in range(63)]\ny = [math.sin(v) for v in x]\n\nfig, ax = plt.subplots(figsize=(6,3))\nax.plot(x, y, color="#58a6ff", linewidth=2)\nax.set_facecolor("#0d1117")\nfig.patch.set_facecolor("#0d1117")\nax.tick_params(colors="#8b949e")\nax.spines[:].set_color("#30363d")\nax.set_title("sin(x)", color="#e6edf3")\nplt.tight_layout()\nplt.show()', storeHistory: true, execId: 'seq-plot-1' },
+        comment: 'Assets appear in the response with id and url. Fetch the plot via GET /assets/{id}.' },
+    ]
+  },
+  {
+    id: 'stdin',
+    icon: '',
+    title: 'Interactive Input (stdin)',
+    desc: 'Handle code that calls input() — the runtime requests stdin and the client provides it.',
+    steps: [
+      { label: 'Execute with input()', desc: 'Starts and waits for stdin', method: 'POST', path: '/execute/stream', sse: true, noWait: true,
+        body: { code: 'name = input("What is your name? ")\nprint(f"Hello, {name}!")', storeHistory: true, allowStdin: true, execId: 'seq-stdin-1' },
+        comment: 'Watch for the stdin_request SSE event — that\'s the runtime asking for input.' },
+      { label: 'Send input', desc: 'Provide the answer', method: 'POST', path: '/input', delay: 800,
+        body: { execId: 'seq-stdin-1', text: 'World\n' },
+        comment: 'Include \\n to submit. The execution continues and prints the greeting.' },
+      { label: 'Verify result', desc: 'Check the variable was set', method: 'POST', path: '/hover', delay: 1000,
+        body: { code: 'name', cursor: 4 },
+        comment: 'name is now "World" in the namespace.' },
+    ]
+  },
+  {
+    id: 'stdin-blocked',
+    icon: '',
+    title: 'Stdin Blocked (Agent Mode)',
+    desc: 'When allowStdin is false, input() calls fail immediately instead of hanging — essential for AI agents.',
+    steps: [
+      { label: 'Execute with stdin blocked', desc: 'input() should fail', method: 'POST', path: '/execute',
+        body: { code: 'answer = input("This will fail: ")', storeHistory: false, allowStdin: false, execId: 'seq-nostdin-1' },
+        comment: 'allowStdin: false prevents the execution from hanging. Error type: StdinNotAllowed or similar.' },
+    ]
+  },
+];
+
+// --- Endpoint definitions ---
+const ENDPOINTS = [
+  { section: 'Status' },
+  { id: 'health', method: 'GET', path: '/health', desc: 'Runtime liveness & state', body: null },
+  { id: 'capabilities', method: 'GET', path: '/capabilities', desc: 'Feature discovery', body: null },
+
+  { section: 'Execution' },
+  { id: 'execute', method: 'POST', path: '/execute', desc: 'Run code, return result',
+    body: { code: 'print("Hello from MRP!")\n2 + 2', storeHistory: true, silent: false, allowStdin: true, execId: 'playground-1' } },
+  { id: 'execute-stream', method: 'POST', path: '/execute/stream', desc: 'Run code, SSE stream', sse: true,
+    body: { code: 'import time\nfor i in range(5):\n    print(f"step {i}")\n    time.sleep(0.3)\nprint("done!")', storeHistory: true, allowStdin: false, execId: 'playground-stream-1' } },
+  { id: 'interrupt', method: 'POST', path: '/interrupt', desc: 'Cancel running execution', body: {} },
+  { id: 'input', method: 'POST', path: '/input', desc: 'Send stdin to execution',
+    body: { execId: 'playground-1', text: 'hello\n' } },
+  { id: 'input-cancel', method: 'POST', path: '/input/cancel', desc: 'Cancel pending input',
+    body: { execId: 'playground-1' } },
+  { id: 'reset', method: 'POST', path: '/reset', desc: 'Clear runtime state',
+    body: { scope: ['namespace'] } },
+
+  { section: 'Introspection' },
+  { id: 'complete', method: 'POST', path: '/complete', desc: 'Completions at cursor',
+    body: { code: 'import os\nos.path.', cursor: 18, triggerKind: 'character', triggerCharacter: '.' } },
+  { id: 'inspect', method: 'POST', path: '/inspect', desc: 'Symbol details',
+    body: { code: 'print', cursor: 5, detail: 1 } },
+  { id: 'hover', method: 'POST', path: '/hover', desc: 'Quick tooltip',
+    body: { code: 'print', cursor: 5 } },
+  { id: 'variables', method: 'POST', path: '/variables', desc: 'List namespace variables',
+    body: { filter: { excludePrivate: true }, maxValueLength: 200 } },
+  { id: 'variable-detail', method: 'POST', path: '/variables/{name}', desc: 'Drill into variable',
+    body: { path: [] }, paramHint: 'name' },
+
+  { section: 'Code Analysis' },
+  { id: 'is-complete', method: 'POST', path: '/is_complete', desc: 'Is code a complete statement?',
+    body: { code: 'def foo():\n    pass' } },
+  { id: 'format', method: 'POST', path: '/format', desc: 'Format code',
+    body: { code: 'x=1+2' } },
+
+  { section: 'History & Assets' },
+  { id: 'history', method: 'POST', path: '/history', desc: 'Execution history',
+    body: { n: 20 } },
+];
+
+// --- State ---
+let activeEndpoint = null;
+let capabilities = null;
+let currentAbort = null;
+
+// --- Sidebar ---
+const sidebar = document.getElementById('sidebar');
+function renderSidebar() {
+  sidebar.innerHTML = '';
+
+  // Sequences section
+  const seqSection = document.createElement('div');
+  seqSection.className = 'section';
+  seqSection.textContent = 'Sequences';
+  sidebar.appendChild(seqSection);
+
+  for (const seq of SEQUENCES) {
+    const btn = document.createElement('button');
+    btn.className = 'seq-btn';
+    btn.dataset.id = 'seq-' + seq.id;
+    btn.innerHTML = seq.title;
+    btn.onclick = () => selectSequence(seq);
+    sidebar.appendChild(btn);
+  }
+
+  // Divider
+  const hr = document.createElement('div');
+  hr.style.cssText = 'border-top:1px solid var(--border);margin:8px 0';
+  sidebar.appendChild(hr);
+
+  // Endpoint section
+  for (const ep of ENDPOINTS) {
+    if (ep.section) {
+      const div = document.createElement('div');
+      div.className = 'section';
+      div.textContent = ep.section;
+      sidebar.appendChild(div);
+      continue;
+    }
+    const btn = document.createElement('button');
+    btn.dataset.id = ep.id;
+    btn.innerHTML = `<span class="method ${ep.method.toLowerCase()}">${ep.method}</span>${ep.path}`;
+    btn.onclick = () => selectEndpoint(ep);
+    sidebar.appendChild(btn);
+  }
+}
+
+// --- Main panel ---
+function selectEndpoint(ep) {
+  activeEndpoint = ep;
+  sidebar.querySelectorAll('button').forEach(b => b.classList.toggle('active', b.dataset.id === ep.id));
+  renderMain(ep);
+}
+
+function renderMain(ep) {
+  const main = document.getElementById('main');
+  const isSSE = ep.sse;
+
+  let urlBar = '';
+  if (ep.paramHint) {
+    urlBar = `<div class="url-bar">
+      <span>${ep.method} ${BASE}${ep.path.replace(`{${ep.paramHint}}`, '')}</span>
+      <input id="pathParam" placeholder="${ep.paramHint}" value="x" />
+    </div>`;
+  }
+
+  main.innerHTML = `
+    <div class="endpoint-header">
+      <span class="method ${ep.method.toLowerCase()}" style="font-size:12px;padding:2px 8px;border-radius:4px">${ep.method}</span>
+      <h2>${ep.path}</h2>
+      <span class="desc">${ep.desc}</span>
+    </div>
+    ${urlBar}
+    <div class="panels">
+      <div class="panel">
+        <div class="panel-header">Request${ep.body === null ? ' (no body)' : ''}</div>
+        ${ep.body !== null
+          ? `<textarea id="reqBody">${JSON.stringify(ep.body, null, 2)}</textarea>`
+          : `<pre class="response" style="color:var(--muted)">This endpoint takes no request body.</pre>`
+        }
+        <div class="toolbar">
+          <button class="btn primary" id="sendBtn" onclick="send()">Send</button>
+          ${isSSE ? '<button class="btn danger" id="stopBtn" onclick="stopSSE()" style="display:none">Stop</button>' : ''}
+          <span class="spacer"></span>
+          <span class="time" id="timing"></span>
+        </div>
+      </div>
+      <div class="panel">
+        <div class="panel-header">Response <span class="badge" id="statusBadge"></span></div>
+        ${isSSE
+          ? `<div class="sse-log" id="sseLog"></div>`
+          : `<pre class="response" id="resBody">Click Send to make a request.</pre>`
+        }
+      </div>
+    </div>
+  `;
+
+  // Keyboard shortcut
+  const ta = document.getElementById('reqBody');
+  if (ta) {
+    ta.addEventListener('keydown', e => {
+      if ((e.ctrlKey || e.metaKey) && e.key === 'Enter') { e.preventDefault(); send(); }
+      // Tab indent
+      if (e.key === 'Tab') {
+        e.preventDefault();
+        const s = ta.selectionStart, end = ta.selectionEnd;
+        ta.value = ta.value.substring(0, s) + '  ' + ta.value.substring(end);
+        ta.selectionStart = ta.selectionEnd = s + 2;
+      }
+    });
+  }
+}
+
+// --- Send ---
+async function send() {
+  const ep = activeEndpoint;
+  if (!ep) return;
+
+  let url = BASE + ep.path;
+  if (ep.paramHint) {
+    const val = document.getElementById('pathParam')?.value || '';
+    url = BASE + ep.path.replace(`{${ep.paramHint}}`, encodeURIComponent(val));
+  }
+
+  const badge = document.getElementById('statusBadge');
+  const timing = document.getElementById('timing');
+  const t0 = performance.now();
+
+  if (ep.sse) return sendSSE(url, ep, badge, timing, t0);
+
+  const sendBtn = document.getElementById('sendBtn');
+  sendBtn.disabled = true; sendBtn.textContent = '…';
+
+  try {
+    const opts = { method: ep.method, headers: { 'Content-Type': 'application/json' } };
+    const bodyEl = document.getElementById('reqBody');
+    if (ep.body !== null && bodyEl) opts.body = bodyEl.value;
+
+    const res = await fetch(url, opts);
+    const elapsed = ((performance.now() - t0) | 0);
+    timing.textContent = `${elapsed}ms`;
+
+    const status = res.status;
+    badge.textContent = status;
+    badge.className = `badge ${status < 400 ? 's200' : status < 500 ? 's4xx' : 's5xx'}`;
+
+    const text = await res.text();
+    let display;
+    try { display = JSON.stringify(JSON.parse(text), null, 2); } catch { display = text; }
+    document.getElementById('resBody').textContent = display;
+  } catch (err) {
+    badge.textContent = 'ERR';
+    badge.className = 'badge s5xx';
+    document.getElementById('resBody').textContent = `Network error:\n${err.message}`;
+  } finally {
+    sendBtn.disabled = false; sendBtn.textContent = 'Send';
+  }
+}
+
+// --- SSE ---
+async function sendSSE(url, ep, badge, timing, t0) {
+  const log = document.getElementById('sseLog');
+  const sendBtn = document.getElementById('sendBtn');
+  const stopBtn = document.getElementById('stopBtn');
+  log.innerHTML = '';
+  sendBtn.disabled = true;
+  stopBtn.style.display = '';
+  badge.textContent = 'SSE';
+  badge.className = 'badge sse';
+
+  const controller = new AbortController();
+  currentAbort = controller;
+
+  try {
+    const bodyEl = document.getElementById('reqBody');
+    const res = await fetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: bodyEl ? bodyEl.value : '{}',
+      signal: controller.signal,
+    });
+
+    if (!res.ok) {
+      const text = await res.text();
+      badge.textContent = res.status;
+      badge.className = 'badge s4xx';
+      addSSELine(log, 'error', text);
+      return;
+    }
+
+    const reader = res.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = '';
+    let currentEvent = 'message';
+
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+
+      const lines = buffer.split('\n');
+      buffer = lines.pop(); // keep incomplete line
+
+      for (const line of lines) {
+        if (line.startsWith('event: ')) {
+          currentEvent = line.slice(7).trim();
+        } else if (line.startsWith('data: ')) {
+          const raw = line.slice(6);
+          addSSELine(log, currentEvent, raw);
+          currentEvent = 'message';
+        } else if (line.startsWith(': ')) {
+          // keepalive comment
+          addSSELine(log, 'keepalive', line.slice(2), true);
+        }
+      }
+    }
+
+    const elapsed = ((performance.now() - t0) | 0);
+    timing.textContent = `${elapsed}ms`;
+    badge.textContent = 'done';
+    badge.className = 'badge s200';
+  } catch (err) {
+    if (err.name === 'AbortError') {
+      badge.textContent = 'aborted';
+      badge.className = 'badge s4xx';
+    } else {
+      badge.textContent = 'ERR';
+      badge.className = 'badge s5xx';
+      addSSELine(log, 'error', err.message);
+    }
+  } finally {
+    sendBtn.disabled = false;
+    stopBtn.style.display = 'none';
+    currentAbort = null;
+  }
+}
+
+function addSSELine(log, type, data, dim) {
+  const div = document.createElement('div');
+  div.className = 'sse-event';
+  let pretty = data;
+  try { pretty = JSON.stringify(JSON.parse(data), null, 2); } catch {}
+  div.innerHTML = `<span class="ev-type">${esc(type)}</span><span class="ev-data" style="${dim ? 'color:var(--muted)' : ''}">${esc(pretty)}</span>`;
+  log.appendChild(div);
+  log.scrollTop = log.scrollHeight;
+}
+
+function stopSSE() {
+  if (currentAbort) currentAbort.abort();
+}
+
+function esc(s) {
+  return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+}
+
+// --- Health polling ---
+async function pollHealth() {
+  const dot = document.getElementById('statusDot');
+  const txt = document.getElementById('statusText');
+  const info = document.getElementById('runtimeInfo');
+  try {
+    const res = await fetch(BASE + '/health', { signal: AbortSignal.timeout(3000) });
+    const h = await res.json();
+    dot.className = 'dot ok';
+    txt.textContent = `${h.state} · exec #${h.executionCount} · rev ${h.stateRevision}`;
+    if (!capabilities) {
+      const c = await fetch(BASE + '/capabilities').then(r => r.json());
+      capabilities = c;
+      info.textContent = `${c.runtime} ${c.version} · ${c.languages.join(', ')} · ${BASE}`;
+    }
+  } catch {
+    dot.className = 'dot dead';
+    txt.textContent = 'disconnected';
+  }
+}
+
+// --- Sequences ---
+let activeSequence = null;
+let seqAbort = null;
+let seqRunning = false;
+// Track background SSE streams from noWait steps
+let bgStreams = [];
+
+function selectSequence(seq) {
+  activeSequence = seq;
+  activeEndpoint = null;
+  sidebar.querySelectorAll('button').forEach(b =>
+    b.classList.toggle('active', b.dataset.id === 'seq-' + seq.id)
+  );
+  renderSequence(seq);
+}
+
+function renderSequence(seq) {
+  const main = document.getElementById('main');
+  main.innerHTML = `
+    <div class="seq-header">
+      <h2>${seq.title}</h2>
+      <p>${seq.desc}</p>
+    </div>
+    <div class="seq-controls">
+      <button class="btn primary" id="seqRunBtn" onclick="runSequence()">Run All</button>
+      <button class="btn" id="seqStepBtn" onclick="stepSequence()">Step</button>
+      <button class="btn danger" id="seqStopBtn" onclick="stopSequence()" style="display:none">Stop</button>
+      <button class="btn" onclick="renderSequence(activeSequence)">Reset</button>
+      <span class="progress-text" id="seqProgress"></span>
+    </div>
+    <div class="seq-timeline" id="seqTimeline">
+      ${seq.steps.map((step, i) => `
+        <div class="seq-step" id="seq-step-${i}" data-idx="${i}">
+          <div class="seq-step-header" onclick="toggleStep(${i})">
+            <span class="seq-chevron">▶</span>
+            <span class="seq-step-num">${i + 1}</span>
+            <span class="seq-step-title">
+              <span class="step-label">${esc(step.label)}</span>
+              <span class="step-desc">${esc(step.desc)}</span>
+            </span>
+            <span class="seq-step-method ${step.method.toLowerCase()}">${step.method}</span>
+            <code style="font-size:11px;color:var(--muted)">${esc(step.path)}</code>
+            <span class="seq-step-status" id="seq-status-${i}"></span>
+            <span class="seq-step-time" id="seq-time-${i}"></span>
+          </div>
+          <div class="seq-step-detail" id="seq-detail-${i}">
+            ${step.comment ? `<div class="step-comment">${esc(step.comment)}</div>` : ''}
+            ${step.body ? `<div class="detail-section"><div class="detail-label">Request Body</div><pre>${esc(JSON.stringify(step.body, null, 2))}</pre></div>` : ''}
+            <div class="detail-section" id="seq-response-${i}"></div>
+          </div>
+        </div>
+      `).join('')}
+    </div>
+  `;
+}
+
+function toggleStep(i) {
+  document.getElementById(`seq-step-${i}`)?.classList.toggle('expanded');
+}
+
+// Execute a single step, return { status, data, duration }
+async function executeStep(step, signal) {
+  const url = BASE + step.path;
+  const t0 = performance.now();
+
+  if (step.delay) await new Promise(r => setTimeout(r, step.delay));
+
+  if (step.sse) {
+    // SSE execution
+    const res = await fetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(step.body || {}),
+      signal,
+    });
+
+    if (!res.ok) {
+      const text = await res.text();
+      return { status: res.status, data: text, events: [], duration: performance.now() - t0 };
+    }
+
+    if (step.noWait) {
+      // Don't consume the stream — store it for background consumption
+      const reader = res.body.getReader();
+      const decoder = new TextDecoder();
+      const events = [];
+      const stream = { reader, events, done: false };
+      bgStreams.push(stream);
+      // Start background reader
+      (async () => {
+        let buffer = '', currentEvent = 'message';
+        try {
+          while (true) {
+            const { done, value } = await reader.read();
+            if (done) break;
+            buffer += decoder.decode(value, { stream: true });
+            const lines = buffer.split('\n');
+            buffer = lines.pop();
+            for (const line of lines) {
+              if (line.startsWith('event: ')) currentEvent = line.slice(7).trim();
+              else if (line.startsWith('data: ')) {
+                events.push({ type: currentEvent, data: line.slice(6) });
+                currentEvent = 'message';
+              }
+            }
+          }
+        } catch {}
+        stream.done = true;
+      })();
+      // Wait briefly to let the execution start
+      await new Promise(r => setTimeout(r, 300));
+      return { status: res.status, data: null, events, duration: performance.now() - t0, streaming: true };
+    }
+
+    // Consume full SSE stream
+    const reader = res.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = '', currentEvent = 'message';
+    const events = [];
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+      const lines = buffer.split('\n');
+      buffer = lines.pop();
+      for (const line of lines) {
+        if (line.startsWith('event: ')) currentEvent = line.slice(7).trim();
+        else if (line.startsWith('data: ')) {
+          events.push({ type: currentEvent, data: line.slice(6) });
+          currentEvent = 'message';
+        }
+      }
+    }
+    return { status: res.status, data: null, events, duration: performance.now() - t0 };
+  }
+
+  // Regular HTTP
+  const opts = { method: step.method, headers: { 'Content-Type': 'application/json' }, signal };
+  if (step.body) opts.body = JSON.stringify(step.body);
+  const res = await fetch(url, opts);
+  const text = await res.text();
+  let data;
+  try { data = JSON.parse(text); } catch { data = text; }
+  return { status: res.status, data, duration: performance.now() - t0 };
+}
+
+function renderStepResult(i, result) {
+  const stepEl = document.getElementById(`seq-step-${i}`);
+  const statusEl = document.getElementById(`seq-status-${i}`);
+  const timeEl = document.getElementById(`seq-time-${i}`);
+  const responseEl = document.getElementById(`seq-response-${i}`);
+
+  const ms = Math.round(result.duration);
+  timeEl.textContent = `${ms}ms`;
+
+  if (result.events) {
+    // SSE result
+    const statusClass = result.streaming ? 'sse-ok' : (result.status < 400 ? 's2xx' : 's4xx');
+    statusEl.textContent = result.streaming ? 'SSE ...' : 'SSE ok';
+    statusEl.className = `seq-step-status ${statusClass}`;
+    stepEl.classList.add(result.status < 400 ? 'done' : 'fail');
+
+    let html = '<div class="detail-label">SSE Events</div><div class="sse-events">';
+    for (const ev of result.events) {
+      let pretty = ev.data;
+      try { pretty = JSON.stringify(JSON.parse(ev.data), null, 2); } catch {}
+      html += `<div class="sse-event"><span class="ev-type">${esc(ev.type)}</span><span class="ev-data">${esc(pretty)}</span></div>`;
+    }
+    if (result.streaming) {
+      html += `<div class="sse-event"><span class="ev-type" style="color:var(--muted)">…</span><span class="ev-data" style="color:var(--muted)">stream continues in background</span></div>`;
+    }
+    html += '</div>';
+    responseEl.innerHTML = html;
+  } else {
+    // Regular response
+    const statusClass = result.status < 400 ? 's2xx' : 's4xx';
+    statusEl.textContent = result.status;
+    statusEl.className = `seq-step-status ${statusClass}`;
+    stepEl.classList.add(result.status < 400 ? 'done' : (result.status === 409 ? 'done' : 'fail'));
+    // Mark expected 409s as "done" not "fail"
+    const step = activeSequence.steps[i];
+    if (step.expectStatus && result.status === step.expectStatus) {
+      stepEl.classList.remove('fail');
+      stepEl.classList.add('done');
+    }
+
+    const pretty = typeof result.data === 'string' ? result.data : JSON.stringify(result.data, null, 2);
+    responseEl.innerHTML = `<div class="detail-label">Response</div><pre>${esc(pretty)}</pre>`;
+  }
+}
+
+let seqStepIndex = 0;
+let seqStepResolve = null;
+
+async function runSequence() {
+  if (seqRunning) return;
+  const seq = activeSequence;
+  if (!seq) return;
+  seqRunning = true;
+  bgStreams = [];
+  seqStepIndex = 0;
+
+  const runBtn = document.getElementById('seqRunBtn');
+  const stepBtn = document.getElementById('seqStepBtn');
+  const stopBtn = document.getElementById('seqStopBtn');
+  runBtn.style.display = 'none';
+  stepBtn.style.display = 'none';
+  stopBtn.style.display = '';
+
+  const controller = new AbortController();
+  seqAbort = controller;
+
+  try {
+    for (let i = 0; i < seq.steps.length; i++) {
+      seqStepIndex = i;
+      if (controller.signal.aborted) break;
+      const step = seq.steps[i];
+      const stepEl = document.getElementById(`seq-step-${i}`);
+      stepEl.classList.add('running');
+      document.getElementById('seqProgress').textContent = `Step ${i + 1} of ${seq.steps.length}`;
+
+      // Auto-expand current step
+      stepEl.classList.add('expanded');
+
+      const result = await executeStep(step, controller.signal);
+      stepEl.classList.remove('running');
+      renderStepResult(i, result);
+
+      // Scroll into view
+      stepEl.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+    }
+    document.getElementById('seqProgress').textContent = 'Complete';
+  } catch (err) {
+    if (err.name !== 'AbortError') {
+      document.getElementById('seqProgress').textContent = `Error: ${err.message}`;
+    } else {
+      document.getElementById('seqProgress').textContent = 'Stopped';
+      // Mark remaining as skipped
+      for (let i = seqStepIndex; i < seq.steps.length; i++) {
+        const el = document.getElementById(`seq-step-${i}`);
+        if (!el.classList.contains('done') && !el.classList.contains('fail')) {
+          el.classList.add('skipped');
+        }
+      }
+    }
+  } finally {
+    seqRunning = false;
+    seqAbort = null;
+    runBtn.style.display = '';
+    stepBtn.style.display = '';
+    stopBtn.style.display = 'none';
+    // Cancel any background SSE streams
+    for (const s of bgStreams) {
+      try { s.reader.cancel(); } catch {}
+    }
+    bgStreams = [];
+  }
+}
+
+async function stepSequence() {
+  if (seqRunning) return;
+  const seq = activeSequence;
+  if (!seq) return;
+
+  // Find next unexecuted step
+  let i = 0;
+  while (i < seq.steps.length) {
+    const el = document.getElementById(`seq-step-${i}`);
+    if (!el.classList.contains('done') && !el.classList.contains('fail')) break;
+    i++;
+  }
+  if (i >= seq.steps.length) return;
+
+  seqRunning = true;
+  const controller = new AbortController();
+  seqAbort = controller;
+  const stepBtn = document.getElementById('seqStepBtn');
+  stepBtn.disabled = true;
+
+  try {
+    const step = seq.steps[i];
+    const stepEl = document.getElementById(`seq-step-${i}`);
+    stepEl.classList.add('running', 'expanded');
+    document.getElementById('seqProgress').textContent = `Step ${i + 1} of ${seq.steps.length}`;
+
+    const result = await executeStep(step, controller.signal);
+    stepEl.classList.remove('running');
+    renderStepResult(i, result);
+
+    if (i === seq.steps.length - 1) {
+      document.getElementById('seqProgress').textContent = 'Complete';
+    }
+  } catch (err) {
+    if (err.name !== 'AbortError') {
+      document.getElementById('seqProgress').textContent = `Error: ${err.message}`;
+    }
+  } finally {
+    seqRunning = false;
+    seqAbort = null;
+    stepBtn.disabled = false;
+  }
+}
+
+function stopSequence() {
+  if (seqAbort) seqAbort.abort();
+}
+
+// --- Init ---
+renderSidebar();
+selectSequence(SEQUENCES[0]);
+pollHealth();
+setInterval(pollHealth, 5000);
+
+// Global keyboard
+document.addEventListener('keydown', e => {
+  if ((e.ctrlKey || e.metaKey) && e.key === 'Enter') {
+    e.preventDefault(); send();
+  }
+});
+</script>
+</body>
+</html>
