@@ -1,16 +1,13 @@
 """
-mrmd-python: Python runtime server implementing the MRMD Runtime Protocol (MRP)
+mrmd-python: MRP runtime server for Python.
 
-Usage:
-    mrmd-python [--host HOST] [--port PORT] [--cwd DIR]
-
-Or programmatically:
-    from mrmd_python import create_app
-    app = create_app()
+Primary interface is MCP, served at /mcp.
 """
 
-from .server import create_app, MRPServer
+from .service import RuntimeService
+from .mcp_server import create_mcp_server
+from .app import create_app
 from .worker import IPythonWorker
 
-__version__ = "0.3.5"
-__all__ = ["create_app", "MRPServer", "IPythonWorker", "__version__"]
+__version__ = "0.4.0"
+__all__ = ["RuntimeService", "create_mcp_server", "create_app", "IPythonWorker"]

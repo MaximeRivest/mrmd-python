@@ -1,7 +1,11 @@
 """
-MRP Type Definitions
+MRP Type Definitions — 0.4.0-draft
 
-Matches the MRMD Runtime Protocol specification.
+Two layers:
+- Engine types (dataclasses): used internally by IPythonWorker and subprocess layer.
+  These are stable and should not change when the protocol evolves.
+- Protocol types (dataclasses): match the MRP 0.4.0 spec schemas.
+  These are what the MCP tools return.
 """
 
 from dataclasses import dataclass, field
@@ -9,48 +13,25 @@ from typing import Any, Literal
 
 
 # =============================================================================
-# Capabilities
+# Exceptions
 # =============================================================================
 
 
-@dataclass
-class CapabilityFeatures:
-    execute: bool = True
-    executeStream: bool = True
-    interrupt: bool = True
-    complete: bool = True
-    inspect: bool = True
-    hover: bool = True
-    variables: bool = True
-    variableExpand: bool = True
-    reset: bool = True
-    isComplete: bool = True
-    format: bool = False
-    history: bool = True
-    assets: bool = True
+class InputCancelledError(Exception):
+    """Raised when user cancels input request."""
+    pass
 
 
-@dataclass
-class Environment:
-    cwd: str = ""
-    executable: str = ""
-    virtualenv: str | None = None
-
-
-@dataclass
-class Capabilities:
-    protocol: str = "mrp"
-    protocolVersion: str = "0.3.0"
-    runtime: str = "mrmd-python"
-    version: str = "0.3.0"
-    languages: list[str] = field(default_factory=lambda: ["python", "py", "python3"])
-    features: CapabilityFeatures = field(default_factory=CapabilityFeatures)
-    environment: Environment = field(default_factory=Environment)
-    lspFallback: str | None = None
+class StdinNotAllowedError(Exception):
+    """Raised when code requests stdin in a non-interactive execution context."""
+    pass
 
 
 # =============================================================================
-# Execution
+# Engine Types — used by worker.py and subprocess_manager.py
+#
+# These are the internal data containers. The worker produces these.
+# The service layer converts them into protocol types.
 # =============================================================================
 
 
@@ -80,6 +61,7 @@ class Asset:
 
 @dataclass
 class ExecuteResult:
+    """Engine-level execution result. Produced by IPythonWorker."""
     success: bool = True
     stdout: str = ""
     stderr: str = ""
@@ -94,26 +76,13 @@ class ExecuteResult:
     warnings: list[dict[str, str]] = field(default_factory=list)
 
 
-# =============================================================================
-# Completion
-# =============================================================================
-
-
 @dataclass
 class CompletionItem:
     label: str
     insertText: str | None = None
     kind: Literal[
-        "variable",
-        "function",
-        "method",
-        "property",
-        "class",
-        "module",
-        "keyword",
-        "constant",
-        "field",
-        "value",
+        "variable", "function", "method", "property", "class",
+        "module", "keyword", "constant", "field", "value",
     ] = "variable"
     detail: str | None = None
     documentation: str | None = None
@@ -128,11 +97,6 @@ class CompleteResult:
     cursorStart: int = 0
     cursorEnd: int = 0
     source: Literal["runtime", "lsp", "static"] = "runtime"
-
-
-# =============================================================================
-# Inspection
-# =============================================================================
 
 
 @dataclass
@@ -161,11 +125,6 @@ class HoverResult:
     value: str | None = None
     signature: str | None = None
     docstring: str | None = None
-
-
-# =============================================================================
-# Variables
-# =============================================================================
 
 
 @dataclass
@@ -197,11 +156,6 @@ class VariableDetail(Variable):
     attributes: list[str] | None = None
 
 
-# =============================================================================
-# Code Analysis
-# =============================================================================
-
-
 @dataclass
 class IsCompleteResult:
     status: Literal["complete", "incomplete", "invalid", "unknown"] = "unknown"
@@ -226,11 +180,6 @@ class HistoryResult:
     hasMore: bool = False
 
 
-# =============================================================================
-# Streaming Events
-# =============================================================================
-
-
 @dataclass
 class StdinRequest:
     prompt: str = ""
@@ -239,15 +188,125 @@ class StdinRequest:
 
 
 # =============================================================================
-# Exceptions
+# Protocol Types — MRP 0.4.0-draft
+#
+# These match the spec schemas in mrp-openapi.yaml.
+# The service layer produces these from engine types.
 # =============================================================================
 
 
-class InputCancelledError(Exception):
-    """Raised when user cancels input request."""
-    pass
+@dataclass
+class Warning:
+    code: str
+    message: str
 
 
-class StdinNotAllowedError(Exception):
-    """Raised when code requests stdin in a non-interactive execution context."""
-    pass
+@dataclass
+class CapabilityFeatures:
+    execute: bool = True
+    executionEvents: bool = True
+    input: bool = True
+    cancelExecution: bool = True
+    complete: bool = True
+    inspect: bool = True
+    hover: bool = True
+    variables: bool = True
+    variableExpand: bool = True
+    reset: bool = True
+    isComplete: bool = True
+    format: bool = False
+    history: bool = True
+    assets: bool = True
+
+
+@dataclass
+class Environment:
+    cwd: str = ""
+    executable: str = ""
+    virtualenv: str | None = None
+
+
+@dataclass
+class Capabilities:
+    protocol: str = "mrp"
+    protocolVersion: str = "0.4.0-draft"
+    runtime: str = "mrmd-python"
+    version: str = "0.4.0"
+    languages: list[str] = field(default_factory=lambda: ["python", "py", "python3"])
+    features: CapabilityFeatures = field(default_factory=CapabilityFeatures)
+    environment: Environment = field(default_factory=Environment)
+    lspFallback: str | None = None
+
+
+@dataclass
+class Health:
+    status: str = "ok"
+    state: str = "idle"  # idle, executing, waiting_input
+    runtime: str = "mrmd-python"
+    currentExecutionId: str | None = None
+    executionCount: int = 0
+    stateRevision: int = 0
+    uptimeSeconds: int = 0
+
+
+@dataclass
+class InputRequestInfo:
+    inputRequestId: str
+    prompt: str = ""
+    password: bool = False
+
+
+@dataclass
+class ExecutionState:
+    executionId: str
+    clientExecutionId: str | None = None
+    status: Literal["working", "input_required", "completed", "failed", "cancelled"] = "working"
+    statusMessage: str | None = None
+    createdAt: str = ""
+    lastUpdatedAt: str = ""
+    pollIntervalMs: int | None = 500
+    ttlMs: int | None = 3600000
+    currentSeq: int = 0
+    stateRevision: int = 0
+    inputRequest: InputRequestInfo | None = None
+    warnings: list[Warning] = field(default_factory=list)
+
+
+@dataclass
+class ExecutionEvent:
+    seq: int
+    timestamp: str
+    type: Literal["stdout", "stderr", "display", "asset", "warning", "input_requested"]
+    # type-specific fields — exactly one should be set
+    content: str | None = None            # stdout, stderr
+    displayData: DisplayData | None = None  # display
+    asset: Asset | None = None             # asset
+    warning: Warning | None = None          # warning
+    inputRequest: InputRequestInfo | None = None  # input_requested
+
+
+@dataclass
+class ExecutionEventsResponse:
+    executionId: str
+    events: list[ExecutionEvent] = field(default_factory=list)
+    nextSeq: int = 1
+    done: bool = False
+
+
+@dataclass
+class ExecutionResult:
+    """Protocol-level final execution result."""
+    executionId: str
+    status: Literal["completed", "failed", "cancelled"] = "completed"
+    success: bool = True
+    stdout: str = ""
+    stderr: str = ""
+    result: str | None = None
+    error: ExecuteError | None = None
+    displayData: list[DisplayData] = field(default_factory=list)
+    assets: list[Asset] = field(default_factory=list)
+    executionCount: int = 0
+    stateRevision: int = 0
+    durationMs: int | None = None
+    imports: list[str] = field(default_factory=list)
+    warnings: list[Warning] = field(default_factory=list)
