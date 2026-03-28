@@ -353,6 +353,68 @@ class RuntimeService:
 
         return self.get_execution_result(execution_id)
 
+    def execute_until_input_or_done(
+        self,
+        code: str,
+        store_history: bool = True,
+        silent: bool = False,
+        allow_input: bool = True,
+        client_execution_id: str | None = None,
+        **kwargs,
+    ) -> tuple[str, dict]:
+        """Execute and wait for terminal OR input_required.
+
+        Returns (status, data) where:
+        - ("completed"|"failed"|"cancelled", execution_result_dict)
+        - ("input_required", execution_state_dict)
+        """
+        accepted = self.start_execution(
+            code=code,
+            store_history=store_history,
+            silent=silent,
+            allow_input=allow_input,
+            client_execution_id=client_execution_id,
+            **kwargs,
+        )
+        execution_id = accepted["execution"]["executionId"]
+        execution = self._executions[execution_id]
+
+        # Wait for terminal or input_required
+        while not execution.is_terminal and execution.status != "input_required":
+            time.sleep(0.05)
+
+        if execution.is_terminal:
+            return execution.status, self.get_execution_result(execution_id)
+        else:
+            return "input_required", self.get_execution(execution_id)
+
+    def provide_input_and_wait(
+        self,
+        text: str,
+    ) -> tuple[str, dict]:
+        """Provide input to current execution and wait for terminal or next input.
+
+        Returns (status, data) same as execute_until_input_or_done.
+        """
+        execution = self._current
+        if not execution or execution.is_terminal:
+            raise RuntimeError("No active execution")
+        if execution.status != "input_required" or execution.input_request is None:
+            raise RuntimeError("No input request pending")
+
+        # Feed input
+        input_request_id = execution.input_request.inputRequestId
+        self.provide_input(execution.execution_id, input_request_id, text)
+
+        # Wait for terminal or next input_required
+        while not execution.is_terminal and execution.status != "input_required":
+            time.sleep(0.05)
+
+        if execution.is_terminal:
+            return execution.status, self.get_execution_result(execution.execution_id)
+        else:
+            return "input_required", self.get_execution(execution.execution_id)
+
     def _run_execution(
         self,
         execution: Execution,

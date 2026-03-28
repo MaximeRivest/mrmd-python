@@ -1,15 +1,269 @@
 """
 MRP MCP Server — the primary interface for mrmd-python.
 
-Defines MCP tools, resources, and task support over a shared RuntimeService.
+3 tools:
+- py:       run code or provide input
+- py_look:  see runtime state, variables, or inspect a symbol
+- py_ctl:   reset or cancel
+
+That's it.
 """
 
+import json
+import re
 from contextlib import asynccontextmanager
-from typing import Any
 
 from fastmcp import FastMCP
 
 from .service import RuntimeService
+
+
+# =============================================================================
+# Formatters — turn verbose dicts into compact text the LLM actually needs
+# =============================================================================
+
+_ANSI_RE = re.compile(r"\x1b\[[0-9;]*[a-zA-Z]")
+
+
+def _strip_ansi(text: str) -> str:
+    return _ANSI_RE.sub("", text)
+
+
+def _clean(text: str | None) -> str:
+    if not text:
+        return ""
+    s = _strip_ansi(text).replace("\r\n", "\n").replace("\r", "\n").strip()
+    # Strip IPython's "Out[N]: " prefix from expression results
+    s = re.sub(r"^Out\[\d+\]: ", "", s)
+    return s
+
+
+def _truncate(text: str, max_lines: int = 100) -> str:
+    lines = text.split("\n")
+    if len(lines) <= max_lines:
+        return text
+    keep = max_lines // 2
+    omitted = len(lines) - max_lines
+    return "\n".join(
+        lines[:keep]
+        + [f"… [{omitted} lines truncated] …"]
+        + lines[-keep:]
+    )
+
+
+def _clip(text: str, max_chars: int = 200) -> str:
+    text = text.replace("\n", " ").strip()
+    if len(text) <= max_chars:
+        return text
+    return text[: max_chars - 15] + " … [truncated]"
+
+
+def _dedup(*blocks: str) -> str:
+    """Join non-empty blocks, skipping duplicates."""
+    seen = set()
+    parts = []
+    for b in blocks:
+        b = b.strip()
+        if b and b not in seen:
+            seen.add(b)
+            parts.append(b)
+    return "\n".join(parts)
+
+
+def _state_hint(result: dict) -> str:
+    """Build the ✓/✗ state hint line."""
+    success = result.get("success", True)
+    marker = "✓" if success else "✗"
+    parts = []
+
+    duration = result.get("durationMs") or result.get("duration")
+    if duration is not None:
+        if duration < 1000:
+            parts.append(f"{duration}ms")
+        else:
+            parts.append(f"{duration / 1000:.1f}s")
+
+    var_count = result.get("_varCount")
+    if var_count is not None:
+        parts.append(f"{var_count} var{'s' if var_count != 1 else ''}")
+
+    assets = result.get("assets", [])
+    if assets:
+        n = len(assets)
+        parts.append(f"{n} asset{'s' if n != 1 else ''}")
+
+    return f"{marker} {' | '.join(parts)}" if parts else marker
+
+
+def format_run(result: dict) -> str:
+    """Format an execution result for the LLM."""
+    stdout = _clean(result.get("stdout"))
+    expr_result = _clean(result.get("result"))
+    stderr = _clean(result.get("stderr"))
+    error = result.get("error")
+
+    lines = []
+
+    if error:
+        # On error: show condensed error, skip raw traceback from stdout
+        if isinstance(error, dict):
+            err_type = error.get("type", "Error")
+            err_msg = error.get("message", "")
+            lines.append(f"{err_type}: {err_msg}")
+            err_line = error.get("line")
+            tb = error.get("traceback", [])
+            if err_line is not None:
+                # Find the offending code line in traceback
+                code_line = None
+                for t in reversed(tb):
+                    t = _strip_ansi(t).strip()
+                    if (t and not t.startswith("Traceback") and
+                            not t.startswith("File ") and
+                            not t.startswith("Cell ") and
+                            "Error" not in t and
+                            "--->" not in t and
+                            t != ""):
+                        code_line = t
+                        break
+                if code_line:
+                    lines.append(f"  line {err_line}: {code_line}")
+                else:
+                    lines.append(f"  line {err_line}")
+        else:
+            lines.append(str(error))
+    else:
+        # On success: show output
+        main = _dedup(stdout, expr_result)
+        if main:
+            lines.append(_truncate(main))
+
+        # Stderr (only when no error)
+        if stderr:
+            if lines:
+                lines.append("")
+            lines.append(f"STDERR: {_clip(stderr, 240)}")
+
+    # State hint
+    lines.append("")
+    lines.append(_state_hint(result))
+
+    return "\n".join(lines)
+
+
+def format_input_requested(state: dict) -> str:
+    """Format an input_required response."""
+    ir = state.get("inputRequest", {})
+    prompt = ir.get("prompt", "")
+    lines = [
+        f'INPUT REQUESTED: "{prompt}"',
+        "",
+        "⏳ use py(input=\"...\") to continue",
+    ]
+    return "\n".join(lines)
+
+
+def format_overview(health: dict, variables: dict) -> str:
+    """Format the default py_look() response."""
+    state = health.get("state", "?")
+    var_list = variables.get("variables", [])
+    exec_count = health.get("executionCount", 0)
+
+    lines = [f"python {state} | {len(var_list)} vars | exec #{exec_count}"]
+
+    if var_list:
+        lines.append("")
+        # Find column widths
+        name_w = max(len(v.get("name", "")) for v in var_list[:25])
+        type_w = max(len(v.get("type", "")) for v in var_list[:25])
+        name_w = max(name_w, 4)
+        type_w = max(type_w, 4)
+
+        for v in var_list[:25]:
+            name = v.get("name", "")
+            vtype = v.get("type", "")
+            value = _clip(v.get("value", ""), 80)
+            lines.append(f"{name:<{name_w}}  {vtype:<{type_w}}  {value}")
+
+        if len(var_list) > 25:
+            lines.append(f"… {len(var_list) - 25} more")
+    else:
+        lines.append("")
+        lines.append("No variables.")
+
+    return "\n".join(lines)
+
+
+def format_inspect(result: dict, symbol: str) -> str:
+    """Format a py_look(at=...) response."""
+    if not result.get("found"):
+        return f"{symbol}: not found in runtime namespace"
+
+    lines = []
+    name = result.get("name") or symbol
+    kind = result.get("kind") or ""
+    vtype = result.get("type") or ""
+
+    header = name
+    if vtype:
+        header += f": {vtype}"
+    if kind and kind != vtype:
+        header += f" ({kind})"
+    lines.append(header)
+
+    sig = result.get("signature")
+    if sig:
+        lines.append(f"  {sig}")
+
+    value = result.get("value")
+    if value:
+        lines.append(f"  Value: {_clip(value, 300)}")
+
+    # Shape/size info from variable detail
+    shape = result.get("shape")
+    if shape:
+        lines.append(f"  Shape: {shape}")
+
+    length = result.get("length")
+    if length is not None:
+        lines.append(f"  Length: {length}")
+
+    children = result.get("children")
+    if isinstance(children, int) and children > 0:
+        lines.append(f"  Children: {children}")
+
+    loc = result.get("file")
+    if loc:
+        line_num = result.get("line")
+        lines.append(f"  Defined in: {loc}{f':{line_num}' if line_num else ''}")
+
+    doc = result.get("docstring")
+    if doc:
+        lines.append("")
+        lines.append(_clip(doc, 500))
+
+    return "\n".join(lines)
+
+
+def format_reset(result: dict) -> str:
+    cleared = ", ".join(result.get("cleared", []))
+    var_count = 0  # after reset, always 0
+    return f"RESET | {cleared} cleared | {var_count} vars"
+
+
+def format_cancel(result: dict) -> str:
+    exec_id = result.get("execution", {}).get("executionId", "?")
+    return f"CANCELLED {exec_id}"
+
+
+# =============================================================================
+# MCP Server
+# =============================================================================
+
+INSTRUCTIONS = (
+    "Python runtime. "
+    "Use py to run code, py_look to see variables and inspect symbols, "
+    "py_ctl to reset or cancel."
+)
 
 
 def create_mcp_server(
@@ -17,7 +271,7 @@ def create_mcp_server(
     name: str = "mrmd-python",
     **service_kwargs,
 ) -> FastMCP:
-    """Create an MCP server backed by a RuntimeService."""
+    """Create the MCP server with 3 agent-friendly tools."""
 
     if service is None:
         service = RuntimeService(**service_kwargs)
@@ -27,215 +281,152 @@ def create_mcp_server(
         yield
         service.shutdown()
 
-    mcp = FastMCP(
-        name=name,
-        instructions=(
-            "Live Python runtime. Use runtime_execute to run code. "
-            "Use runtime_list_variables, runtime_get_variable, runtime_hover, "
-            "and runtime_inspect for live namespace introspection. "
-            "Use runtime_reset to clear state."
-        ),
-        lifespan=lifespan,
-    )
+    mcp = FastMCP(name=name, instructions=INSTRUCTIONS, lifespan=lifespan)
 
-    # ── Resources ────────────────────────────────────────────────
+    # ── Resources ────────────────────────────────────────────
 
     @mcp.resource("mrp://health")
     def health_resource() -> str:
         """Runtime health and current state."""
-        import json
         return json.dumps(service.get_health())
 
     @mcp.resource("mrp://capabilities")
     def capabilities_resource() -> str:
         """Runtime capabilities and feature flags."""
-        import json
         return json.dumps(service.get_capabilities())
 
-    # ── Runtime State Tools ──────────────────────────────────────
+    # ── py: run code or provide input ────────────────────────
 
     @mcp.tool
-    def runtime_get_health() -> dict:
-        """Read lightweight runtime liveness and state."""
-        return service.get_health()
-
-    @mcp.tool
-    def runtime_get_capabilities() -> dict:
-        """Read runtime capabilities and feature flags."""
-        return service.get_capabilities()
-
-    @mcp.tool
-    def runtime_reset(scope: list[str] | None = None) -> dict:
-        """Clear selected runtime state. Scope: namespace, history, assets."""
-        return service.reset(scope=scope)
-
-    # ── Execution Tools ──────────────────────────────────────────
-
-    @mcp.tool
-    def runtime_execute(
-        code: str,
-        store_history: bool = True,
-        silent: bool = False,
+    def py(
+        code: str | None = None,
+        input: str | None = None,
         allow_input: bool = True,
-        client_execution_id: str | None = None,
-    ) -> dict:
-        """Execute code and return the final result.
+    ) -> str:
+        """Run Python code or provide input to a waiting execution.
 
-        This is the primary execution tool. For short code, it returns
-        the complete result. For long-running code, use with MCP task
-        augmentation.
+        code: Python code to execute.
+        input: Text to send to a waiting input() prompt.
+        allow_input: If false, input() calls fail instead of waiting (default true).
         """
-        return service.execute_sync(
-            code=code,
-            store_history=store_history,
-            silent=silent,
-            allow_input=allow_input,
-            client_execution_id=client_execution_id,
-        )
+        if code and input:
+            return "ERROR: provide either code or input, not both"
+
+        if input is not None:
+            # Provide input to waiting execution
+            try:
+                status, data = service.provide_input_and_wait(input)
+            except Exception as e:
+                return f"ERROR: {e}"
+
+            if status == "input_required":
+                return format_input_requested(data)
+            else:
+                # Terminal — enrich with var count
+                _enrich_var_count(service, data)
+                return format_run(data)
+
+        if not code:
+            return "ERROR: provide code to execute"
+
+        # Execute code
+        try:
+            status, data = service.execute_until_input_or_done(
+                code=code,
+                allow_input=allow_input,
+            )
+        except RuntimeError as e:
+            return f"ERROR: {e}"
+
+        if status == "input_required":
+            return format_input_requested(data)
+        else:
+            _enrich_var_count(service, data)
+            return format_run(data)
+
+    # ── py_look: see state, variables, or inspect ────────────
 
     @mcp.tool
-    def runtime_start_execution(
-        code: str,
-        store_history: bool = True,
-        silent: bool = False,
-        allow_input: bool = True,
-        client_execution_id: str | None = None,
-    ) -> dict:
-        """Start a detached execution and return immediately with an execution handle.
+    def py_look(at: str | None = None) -> str:
+        """See runtime state, variables, or inspect a symbol.
 
-        Use runtime_get_execution, runtime_get_execution_events, and
-        runtime_get_execution_result to observe and retrieve the result.
+        No args: overview with variable list.
+        at="df": inspect the symbol df.
+        at="df.columns": drill into nested attribute.
         """
-        return service.start_execution(
-            code=code,
-            store_history=store_history,
-            silent=silent,
-            allow_input=allow_input,
-            client_execution_id=client_execution_id,
-        )
+        if at is None:
+            # Overview: health + variable list
+            health = service.get_health()
+            try:
+                variables = service.list_variables()
+            except RuntimeError:
+                variables = {"variables": [], "count": 0, "truncated": False, "warnings": []}
+            return format_overview(health, variables)
+
+        # Inspect a symbol — try inspect first, fall back to hover
+        try:
+            result = service.inspect(code=at, cursor=len(at), detail=1)
+            if result.get("found"):
+                return format_inspect(result, at)
+        except RuntimeError:
+            pass
+
+        # Try hover
+        try:
+            result = service.hover(code=at, cursor=len(at))
+            if result.get("found"):
+                return format_inspect(result, at)
+        except RuntimeError:
+            pass
+
+        # Try variable detail if it looks like a name
+        if re.match(r"^[a-zA-Z_]\w*$", at):
+            try:
+                detail = service.get_variable(name=at)
+                if detail.get("name"):
+                    return format_inspect(detail, at)
+            except (RuntimeError, KeyError):
+                pass
+
+        return f"{at}: not found in runtime namespace"
+
+    # ── py_ctl: control ──────────────────────────────────────
 
     @mcp.tool
-    def runtime_get_execution(execution_id: str) -> dict:
-        """Read the current state of an execution."""
-        return service.get_execution(execution_id)
+    def py_ctl(op: str, scope: str = "namespace") -> str:
+        """Control the runtime.
 
-    @mcp.tool
-    def runtime_get_execution_events(
-        execution_id: str,
-        after_seq: int = 0,
-        limit: int = 100,
-    ) -> dict:
-        """Read incremental execution events (stdout, stderr, display, assets, warnings)."""
-        return service.get_execution_events(
-            execution_id=execution_id,
-            after_seq=after_seq,
-            limit=limit,
-        )
+        op="reset": clear namespace (scope: "namespace", "history", "assets", or "all").
+        op="cancel": cancel the active execution.
+        """
+        if op == "reset":
+            scopes = ["namespace", "history", "assets"] if scope == "all" else [scope]
+            try:
+                result = service.reset(scope=scopes)
+                return format_reset(result)
+            except RuntimeError as e:
+                return f"ERROR: {e}"
 
-    @mcp.tool
-    def runtime_get_execution_result(execution_id: str) -> dict:
-        """Read the final result of a terminal execution."""
-        return service.get_execution_result(execution_id)
+        elif op == "cancel":
+            health = service.get_health()
+            exec_id = health.get("currentExecutionId")
+            if not exec_id:
+                return "No active execution."
+            try:
+                result = service.cancel_execution(exec_id)
+                return format_cancel(result)
+            except RuntimeError as e:
+                return f"ERROR: {e}"
 
-    @mcp.tool
-    def runtime_provide_input(
-        execution_id: str,
-        input_request_id: str,
-        text: str,
-    ) -> dict:
-        """Provide text input to an execution waiting for input."""
-        return service.provide_input(execution_id, input_request_id, text)
-
-    @mcp.tool
-    def runtime_cancel_input(
-        execution_id: str,
-        input_request_id: str,
-    ) -> dict:
-        """Cancel a pending input request."""
-        return service.cancel_input(execution_id, input_request_id)
-
-    @mcp.tool
-    def runtime_cancel_execution(
-        execution_id: str,
-        reason: str | None = None,
-    ) -> dict:
-        """Cancel an active execution."""
-        return service.cancel_execution(execution_id, reason)
-
-    # ── Language Intelligence Tools ──────────────────────────────
-
-    @mcp.tool
-    def runtime_complete(
-        code: str,
-        cursor: int,
-        trigger_kind: str = "invoked",
-        trigger_character: str | None = None,
-    ) -> dict:
-        """Get completions at cursor position using live runtime state."""
-        return service.complete(code=code, cursor=cursor)
-
-    @mcp.tool
-    def runtime_inspect(
-        code: str,
-        cursor: int,
-        detail: int = 1,
-    ) -> dict:
-        """Get detailed information about a symbol at cursor position."""
-        return service.inspect(code=code, cursor=cursor, detail=detail)
-
-    @mcp.tool
-    def runtime_hover(
-        code: str,
-        cursor: int,
-    ) -> dict:
-        """Get lightweight hover/tooltip information about a symbol."""
-        return service.hover(code=code, cursor=cursor)
-
-    # ── Variable Tools ───────────────────────────────────────────
-
-    @mcp.tool
-    def runtime_list_variables(
-        max_value_length: int = 200,
-    ) -> dict:
-        """List variables in the runtime namespace."""
-        return service.list_variables(maxValueLength=max_value_length)
-
-    @mcp.tool
-    def runtime_get_variable(
-        name: str,
-        path: list[str] | None = None,
-        max_children: int = 100,
-        max_value_length: int = 1000,
-    ) -> dict:
-        """Get detailed information about a variable, optionally drilling into children."""
-        return service.get_variable(
-            name=name,
-            path=path,
-            maxChildren=max_children,
-            maxValueLength=max_value_length,
-        )
-
-    # ── Code Analysis Tools ──────────────────────────────────────
-
-    @mcp.tool
-    def runtime_is_complete(code: str) -> dict:
-        """Check whether code is a complete statement."""
-        return service.is_complete(code=code)
-
-    @mcp.tool
-    def runtime_format(code: str) -> dict:
-        """Format code using the runtime's formatter (e.g., black for Python)."""
-        return service.format_code(code=code)
-
-    # ── History Tool ─────────────────────────────────────────────
-
-    @mcp.tool
-    def runtime_query_history(
-        n: int = 20,
-        pattern: str | None = None,
-        before: int | None = None,
-    ) -> dict:
-        """Read execution input history."""
-        return service.query_history(n=n, pattern=pattern, before=before)
+        return f"ERROR: unknown op '{op}'. Use 'reset' or 'cancel'."
 
     return mcp
+
+
+def _enrich_var_count(service: RuntimeService, result: dict):
+    """Try to add variable count to result for the state hint."""
+    try:
+        variables = service.list_variables()
+        result["_varCount"] = variables.get("count", len(variables.get("variables", [])))
+    except Exception:
+        pass
